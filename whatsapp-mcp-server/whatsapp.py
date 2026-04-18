@@ -20,6 +20,30 @@ WHATSMEOW_DB_PATH = os.getenv(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store", "whatsapp.db"),
 )
 WHATSAPP_API_BASE_URL = os.getenv("WHATSAPP_API_URL", "http://localhost:8080/api")
+TRANSCRIPTIONS_DB_PATH = os.getenv(
+    "WHATSAPP_TRANSCRIPTIONS_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store", "transcriptions.db"),
+)
+
+
+def _attach_transcripts(conn: sqlite3.Connection) -> bool:
+    """Attach transcriptions.db as `tx` if it exists. Returns True when attached."""
+    if not os.path.isfile(TRANSCRIPTIONS_DB_PATH):
+        return False
+    conn.execute("ATTACH DATABASE ? AS tx", (TRANSCRIPTIONS_DB_PATH,))
+    return True
+
+
+def _content_and_join(attached: bool) -> tuple[str, str]:
+    """Return (content SELECT expression, optional LEFT JOIN clause) for transcript overlay."""
+    if not attached:
+        return "messages.content", ""
+    return (
+        "COALESCE(tx.transcriptions.transcription, messages.content)",
+        "LEFT JOIN tx.transcriptions "
+        "ON tx.transcriptions.message_id = messages.id "
+        "AND tx.transcriptions.chat_jid = messages.chat_jid",
+    )
 
 
 @dataclass
@@ -319,11 +343,16 @@ def list_messages(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
+        attached = _attach_transcripts(conn)
+        content_expr, join_clause = _content_and_join(attached)
+
         # Build base query
         query_parts = [
-            "SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"
+            f"SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"
         ]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
+        if join_clause:
+            query_parts.append(join_clause)
         where_clauses = []
         params = []
 
@@ -355,7 +384,7 @@ def list_messages(
             params.append(chat_jid)
 
         if query:
-            where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
+            where_clauses.append(f"LOWER({content_expr}) LIKE LOWER(?)")
             params.append(f"%{query}%")
 
         if where_clauses:
@@ -422,12 +451,16 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
+        attached = _attach_transcripts(conn)
+        content_expr, join_clause = _content_and_join(attached)
+
         # Get the target message first
         cursor.execute(
-            """
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+            f"""
+            SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
+            {join_clause}
             WHERE messages.id = ?
         """,
             (message_id,),
@@ -450,10 +483,11 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
 
         # Get messages before
         cursor.execute(
-            """
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            f"""
+            SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.media_type
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
+            {join_clause}
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
             ORDER BY messages.timestamp DESC
             LIMIT ?
@@ -478,10 +512,11 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
 
         # Get messages after
         cursor.execute(
-            """
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            f"""
+            SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.media_type
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
+            {join_clause}
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
             ORDER BY messages.timestamp ASC
             LIMIT ?
