@@ -99,18 +99,32 @@ def download_via_bridge(message_id: str, chat_jid: str) -> Path | None:
     return Path(path) if path else None
 
 
-def find_audio_file(chat_jid: str, timestamp: str) -> Path | None:
-    """Locate the audio file for a message. Names are audio_YYYYMMDD_HHMMSS.ogg in local time."""
+def find_audio_file(chat_jid: str, timestamp: str, message_id: str | None = None) -> Path | None:
+    """Locate the audio file for a message.
+
+    New format (after bridge filename-collision fix): audio_YYYYMMDD_HHMMSS_MSGID.ogg
+    Legacy format (pre-fix): audio_YYYYMMDD_HHMMSS.ogg
+    Both are accepted; new format preferred.
+    """
     chat_dir = store_dir() / chat_jid
     if not chat_dir.exists():
         return None
     ts = datetime.fromisoformat(timestamp)
-    expected = chat_dir / f"audio_{ts.strftime('%Y%m%d_%H%M%S')}.ogg"
-    if expected.exists():
-        return expected
-    # Fall back to any audio file within the same second (handles edge cases).
-    stem = f"audio_{ts.strftime('%Y%m%d_%H%M%S')}"
-    for candidate in chat_dir.glob(f"{stem}*"):
+    ts_token = ts.strftime('%Y%m%d_%H%M%S')
+
+    # Preferred: new format with message ID
+    if message_id:
+        new_fmt = chat_dir / f"audio_{ts_token}_{message_id}.ogg"
+        if new_fmt.exists():
+            return new_fmt
+
+    # Legacy: timestamp only
+    legacy = chat_dir / f"audio_{ts_token}.ogg"
+    if legacy.exists():
+        return legacy
+
+    # Defensive: any same-second audio file
+    for candidate in chat_dir.glob(f"audio_{ts_token}*"):
         if candidate.suffix in (".ogg", ".opus", ".m4a", ".mp3"):
             return candidate
     return None
@@ -184,18 +198,29 @@ def record_transcript(
 
 
 def lookup_message_for_audio_file(audio_path: Path) -> tuple[str, str] | None:
-    """Given a store/<chat_jid>/audio_YYYYMMDD_HHMMSS.ogg path, return (message_id, chat_jid).
+    """Given an audio file path, return (message_id, chat_jid).
 
-    The bridge names files by timestamp, so two messages arriving in the same
-    second collide on a single filename. Disambiguate by matching file_length
-    to the actual file size on disk.
+    New format (post filename-collision fix): audio_YYYYMMDD_HHMMSS_MSGID.ogg
+      - message ID is in the filename; return directly.
+
+    Legacy format: audio_YYYYMMDD_HHMMSS.ogg
+      - Disambiguate by matching messages.file_length to actual file size.
     """
     chat_jid = audio_path.parent.name
     stem = audio_path.stem
     if not stem.startswith("audio_"):
         return None
-    ts_token = stem[len("audio_"):]
+    rest = stem[len("audio_"):]  # "YYYYMMDD_HHMMSS" or "YYYYMMDD_HHMMSS_MSGID"
+    parts = rest.split("_", 2)
+    if len(parts) < 2:
+        return None
 
+    if len(parts) == 3:
+        # New format: message ID embedded in filename.
+        return parts[2], chat_jid
+
+    # Legacy format: resolve via messages DB + file_length.
+    ts_token = f"{parts[0]}_{parts[1]}"
     try:
         actual_size = audio_path.stat().st_size
     except OSError:
@@ -315,7 +340,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     ok = skipped = failed = 0
     for message_id, chat_jid, timestamp, sender in targets:
         short_id = message_id[:12]
-        audio = find_audio_file(chat_jid, timestamp)
+        audio = find_audio_file(chat_jid, timestamp, message_id)
         if not audio and args.download:
             print(f"[dl]   {short_id} fetching from bridge...")
             audio = download_via_bridge(message_id, chat_jid)
