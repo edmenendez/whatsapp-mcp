@@ -184,17 +184,28 @@ def record_transcript(
 
 
 def lookup_message_for_audio_file(audio_path: Path) -> tuple[str, str] | None:
-    """Given a store/<chat_jid>/audio_YYYYMMDD_HHMMSS.ogg path, return (message_id, chat_jid)."""
+    """Given a store/<chat_jid>/audio_YYYYMMDD_HHMMSS.ogg path, return (message_id, chat_jid).
+
+    The bridge names files by timestamp, so two messages arriving in the same
+    second collide on a single filename. Disambiguate by matching file_length
+    to the actual file size on disk.
+    """
     chat_jid = audio_path.parent.name
     stem = audio_path.stem
     if not stem.startswith("audio_"):
         return None
     ts_token = stem[len("audio_"):]
 
+    try:
+        actual_size = audio_path.stat().st_size
+    except OSError:
+        actual_size = None
+
     conn = sqlite3.connect(f"file:{messages_db_path()}?mode=ro", uri=True)
     try:
-        for mid, ts_str in conn.execute(
-            "SELECT id, timestamp FROM messages WHERE media_type='audio' AND chat_jid=?",
+        candidates: list[tuple[str, int | None]] = []
+        for mid, ts_str, file_length in conn.execute(
+            "SELECT id, timestamp, file_length FROM messages WHERE media_type='audio' AND chat_jid=?",
             (chat_jid,),
         ):
             try:
@@ -202,10 +213,17 @@ def lookup_message_for_audio_file(audio_path: Path) -> tuple[str, str] | None:
             except (TypeError, ValueError):
                 continue
             if dt.strftime("%Y%m%d_%H%M%S") == ts_token:
-                return mid, chat_jid
+                candidates.append((mid, file_length))
     finally:
         conn.close()
-    return None
+
+    if not candidates:
+        return None
+    if actual_size is not None:
+        for mid, file_length in candidates:
+            if file_length == actual_size:
+                return mid, chat_jid
+    return candidates[0][0], chat_jid
 
 
 def already_transcribed(conn: sqlite3.Connection, message_id: str, chat_jid: str) -> bool:
