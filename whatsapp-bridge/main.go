@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -52,6 +53,58 @@ func getEnvBool(key string, def bool) bool {
 		return def
 	}
 }
+
+// getEnvDuration reads a duration env var with a default. Accepts any format
+// understood by time.ParseDuration (e.g. "60s", "2m", "1h30m"). Falls back to
+// def on empty or unparseable values.
+func getEnvDuration(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
+}
+
+// History backfill per-chat cooldown.
+//
+// On-demand WhatsApp history sync hits the user's primary device (phone) and
+// is rate-limited by WhatsApp's servers. The wacli project (another whatsmeow
+// consumer) recommends ≥60s between requests for the same chat. If we exceed
+// that, WhatsApp may silently drop requests or, worst case, throttle or unlink
+// the session.
+//
+// Decisions:
+//   - Enforced server-side, not just in the MCP tool docstring. The bridge is
+//     the shared chokepoint; every caller (MCP, curl, future scripts) hits it.
+//     Relying on the LLM or callers to self-throttle is paper armor.
+//   - Per-chat keying, not global. wacli's guidance is explicitly per-chat;
+//     firing backfill on different chats isn't the same rate-limit vector.
+//   - In-memory state only. A bridge restart clears cooldowns — acceptable
+//     because restarts are rare and a restart-based flood is not a realistic
+//     threat model. Persisting to SQLite adds complexity for negligible gain.
+//   - 429 + Retry-After, not 503 or silent drop. Standard HTTP semantics let
+//     generic clients back off correctly.
+//
+// Known limitations:
+//   - A bridge restart resets the map; a caller could in theory send one
+//     unthrottled request per restart per chat.
+//   - Parallel backfill of many different chats is NOT rate-limited. If you
+//     ever add a "backfill all chats" loop, pace it yourself (e.g. 1–2s
+//     between distinct chats) to avoid a thundering herd to the phone.
+//   - The first request for any chat is always allowed through; there's no
+//     global warmup.
+//   - Cooldown is measured from the last *accepted* request, not the arrival
+//     of the sync response. The phone may still be processing the previous
+//     request when the cooldown expires.
+var (
+	backfillMu       sync.Mutex
+	backfillLastCall = map[string]time.Time{}
+	backfillCooldown = getEnvDuration("HISTORY_BACKFILL_COOLDOWN", 60*time.Second)
+)
 
 // Message represents a chat message for our client
 type Message struct {
@@ -403,6 +456,17 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	return messages, nil
 }
 
+// GetOldestMessage returns the earliest stored message for a chat, used as the
+// anchor for on-demand history sync requests. Returns sql.ErrNoRows if the chat
+// has no messages yet (can't anchor an on-demand sync without a known message).
+func (store *MessageStore) GetOldestMessage(chatJID string) (id string, isFromMe bool, timestamp time.Time, err error) {
+	err = store.db.QueryRow(
+		"SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1",
+		chatJID,
+	).Scan(&id, &isFromMe, &timestamp)
+	return
+}
+
 // Get all chats
 func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
@@ -453,6 +517,20 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+}
+
+// HistoryBackfillRequest represents the request body for the history backfill API
+type HistoryBackfillRequest struct {
+	ChatJID string `json:"chat_jid"`
+	Count   int    `json:"count,omitempty"`
+}
+
+// HistoryBackfillResponse represents the response body for the history backfill API
+type HistoryBackfillResponse struct {
+	Accepted        bool   `json:"accepted"`
+	ChatJID         string `json:"chat_jid,omitempty"`
+	AnchorMessageID string `json:"anchor_message_id,omitempty"`
+	Message         string `json:"message,omitempty"`
 }
 
 // Function to send a WhatsApp message
@@ -1285,6 +1363,143 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				"message": fmt.Sprintf("Typing indicator set to %v", req.IsTyping),
 			})
 		}
+	})
+
+	// Handler for on-demand history backfill. Requests older messages for a
+	// specific chat from the primary device (the user's phone). Best-effort
+	// and asynchronous: the response arrives later as an events.HistorySync
+	// with type ON_DEMAND and is processed by handleHistorySync.
+	http.HandleFunc("/api/history/backfill", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req HistoryBackfillRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+
+		count := req.Count
+		if count <= 0 {
+			count = 50
+		}
+		if count > 50 {
+			count = 50
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(HistoryBackfillResponse{
+				Accepted: false,
+				Message:  fmt.Sprintf("Invalid chat_jid: %v", err),
+			})
+			return
+		}
+
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(HistoryBackfillResponse{
+				Accepted: false,
+				Message:  "WhatsApp client is not connected",
+			})
+			return
+		}
+
+		if client.Store.ID == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(HistoryBackfillResponse{
+				Accepted: false,
+				Message:  "WhatsApp client has no device identity (not paired)",
+			})
+			return
+		}
+
+		// Per-chat cooldown check. See backfillCooldown docs for rationale.
+		backfillMu.Lock()
+		if last, ok := backfillLastCall[req.ChatJID]; ok {
+			if since := time.Since(last); since < backfillCooldown {
+				retryAfter := int((backfillCooldown - since).Seconds()) + 1
+				backfillMu.Unlock()
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				w.WriteHeader(http.StatusTooManyRequests)
+				_ = json.NewEncoder(w).Encode(HistoryBackfillResponse{
+					Accepted: false,
+					ChatJID:  req.ChatJID,
+					Message:  fmt.Sprintf("Cooldown active; try again in %ds", retryAfter),
+				})
+				return
+			}
+		}
+		backfillLastCall[req.ChatJID] = time.Now()
+		backfillMu.Unlock()
+
+		anchorID, anchorFromMe, anchorTS, err := messageStore.GetOldestMessage(req.ChatJID)
+		if err == sql.ErrNoRows {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(HistoryBackfillResponse{
+				Accepted: false,
+				ChatJID:  req.ChatJID,
+				Message:  "No stored messages for this chat to use as an anchor",
+			})
+			return
+		}
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(HistoryBackfillResponse{
+				Accepted: false,
+				Message:  fmt.Sprintf("Failed to query oldest message: %v", err),
+			})
+			return
+		}
+
+		anchor := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				IsFromMe: anchorFromMe,
+			},
+			ID:        anchorID,
+			Timestamp: anchorTS,
+		}
+
+		syncReq := client.BuildHistorySyncRequest(anchor, count)
+		ownID := client.Store.ID.ToNonAD()
+
+		fmt.Printf("History backfill requested: chat=%s anchor=%s anchor_ts=%s count=%d\n",
+			req.ChatJID, anchorID, anchorTS.Format(time.RFC3339), count)
+
+		_, sendErr := client.SendMessage(
+			context.Background(),
+			ownID,
+			syncReq,
+			whatsmeow.SendRequestExtra{Peer: true},
+		)
+		if sendErr != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(HistoryBackfillResponse{
+				Accepted: false,
+				ChatJID:  req.ChatJID,
+				Message:  fmt.Sprintf("Failed to send history sync request: %v", sendErr),
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(HistoryBackfillResponse{
+			Accepted:        true,
+			ChatJID:         req.ChatJID,
+			AnchorMessageID: anchorID,
+			Message:         "History sync request sent to primary device; response arrives asynchronously",
+		})
 	})
 
 	// Start the server with proper timeouts
