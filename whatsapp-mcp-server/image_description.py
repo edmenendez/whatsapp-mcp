@@ -20,6 +20,7 @@ import hashlib
 import os
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -71,27 +72,50 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def download_via_bridge(message_id: str, chat_jid: str) -> Path | None:
-    """Ask the Go bridge to download media. Returns local path or None."""
+def download_via_bridge(message_id: str, chat_jid: str, max_retries: int = 2) -> Path | None:
+    """Ask the Go bridge to download media. Returns local path or None.
+
+    Retries on WhatsApp CDN 403s (which the bridge wraps as HTTP 500 with a
+    "status code 403" message) with exponential backoff — these are often
+    transient rate-limits rather than permanent expirations.
+    """
     import requests
 
-    try:
-        resp = requests.post(
-            f"{BRIDGE_API_URL}/download",
-            json={"message_id": message_id, "chat_jid": chat_jid},
-            timeout=60,
-        )
-    except requests.RequestException as e:
-        print(f"       bridge error: {e}")
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                f"{BRIDGE_API_URL}/download",
+                json={"message_id": message_id, "chat_jid": chat_jid},
+                timeout=60,
+            )
+        except requests.RequestException as e:
+            print(f"       bridge error: {e}")
+            return None
+
+        try:
+            data = resp.json()
+        except ValueError:
+            print(f"       bridge HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+
+        if data.get("success"):
+            path = data.get("path")
+            return Path(path) if path else None
+
+        msg = data.get("message") or ""
+        # 403 from WhatsApp's CDN can mean either rate-limit (transient) or
+        # expired media URL (permanent). We can't tell them apart from the
+        # response, so retry with backoff — a real expiration will still
+        # fail, but a transient rate-limit will succeed on the second try.
+        if "status code 403" in msg and attempt < max_retries:
+            wait = 2 * (attempt + 1) ** 2  # 2s, 8s
+            print(f"       CDN 403 (attempt {attempt + 1}/{max_retries + 1}), waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        if resp.status_code != 200:
+            print(f"       bridge HTTP {resp.status_code}: {msg[:200]}")
         return None
-    if resp.status_code != 200:
-        print(f"       bridge HTTP {resp.status_code}: {resp.text[:200]}")
-        return None
-    data = resp.json()
-    if not data.get("success"):
-        return None
-    path = data.get("path")
-    return Path(path) if path else None
+    return None
 
 
 def find_image_file(chat_jid: str, timestamp: str, message_id: str | None = None) -> Path | None:
@@ -457,6 +481,9 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         ocr_chars = len(ocr_text) if ocr_text else 0
         print(f"[ok] {short_id} desc={len(description)}ch ocr={ocr_chars}ch")
 
+        if args.delay > 0:
+            time.sleep(args.delay)
+
     print(f"\nDone: {ok} ok, {skipped} skipped, {failed} failed.")
     return 0 if failed == 0 else 1
 
@@ -517,6 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
     bf.add_argument("--dry-run", action="store_true", help="Only list what would be described")
     bf.add_argument("--download", action="store_true", help="Fetch missing images from the Go bridge")
     bf.add_argument("--skip-status", action="store_true", help="Skip status@broadcast messages")
+    bf.add_argument("--delay", type=float, default=0.0, help="Seconds to sleep between images (reduces WhatsApp CDN rate-limiting)")
     bf.set_defaults(func=cmd_backfill)
 
     ds = sub.add_parser("describe", help="Describe a single image message by id/chat")
