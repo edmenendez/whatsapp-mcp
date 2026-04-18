@@ -19,6 +19,7 @@ dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
     "requests>=2.32.3",
+    "watchdog>=6.0.0",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +35,7 @@ Repository = "https://github.com/verygoodplugins/whatsapp-mcp"
 Issues = "https://github.com/verygoodplugins/whatsapp-mcp/issues"
 
 [tool.setuptools]
-py-modules = ["main", "whatsapp", "audio", "image_description"]
+py-modules = ["main", "whatsapp", "audio", "image_description", "watch_images"]
 
 [tool.mcp]
 name = "io.github.verygoodplugins/whatsapp-mcp"

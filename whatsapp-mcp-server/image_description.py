@@ -127,6 +127,55 @@ def find_image_file(chat_jid: str, timestamp: str, message_id: str | None = None
     return None
 
 
+def lookup_message_for_image_file(image_path: Path) -> tuple[str, str] | None:
+    """Given an image file path, return (message_id, chat_jid).
+
+    New format: image_YYYYMMDD_HHMMSS_MSGID.ext — message ID embedded, return directly.
+    Legacy format: image_YYYYMMDD_HHMMSS.ext — disambiguate via messages.file_length.
+    """
+    chat_jid = image_path.parent.name
+    stem = image_path.stem
+    if not stem.startswith("image_"):
+        return None
+    rest = stem[len("image_"):]
+    parts = rest.split("_", 2)
+    if len(parts) < 2:
+        return None
+
+    if len(parts) == 3:
+        return parts[2], chat_jid
+
+    ts_token = f"{parts[0]}_{parts[1]}"
+    try:
+        actual_size = image_path.stat().st_size
+    except OSError:
+        actual_size = None
+
+    conn = sqlite3.connect(f"file:{messages_db_path()}?mode=ro", uri=True)
+    try:
+        candidates: list[tuple[str, int | None]] = []
+        for mid, ts_str, file_length in conn.execute(
+            "SELECT id, timestamp, file_length FROM messages WHERE media_type='image' AND chat_jid=?",
+            (chat_jid,),
+        ):
+            try:
+                dt = datetime.fromisoformat(ts_str)
+            except (TypeError, ValueError):
+                continue
+            if dt.strftime("%Y%m%d_%H%M%S") == ts_token:
+                candidates.append((mid, file_length))
+    finally:
+        conn.close()
+
+    if not candidates:
+        return None
+    if actual_size is not None:
+        for mid, file_length in candidates:
+            if file_length == actual_size:
+                return mid, chat_jid
+    return candidates[0][0], chat_jid
+
+
 def image_dimensions(path: Path) -> tuple[int | None, int | None]:
     """Return (width, height) by reading JPEG/PNG headers. Returns (None, None) on failure."""
     try:
