@@ -175,9 +175,17 @@ def iter_untranscribed(
             "SELECT message_id, chat_jid FROM transcriptions"
         )
     }
+    # Skip audios missing the fields whatsmeow needs to decrypt the media.
+    # History-sync rows from before the bridge was paired only carry a stub
+    # and can never be fetched; no point wasting bridge calls on them.
     sql = (
         "SELECT id, chat_jid, timestamp, sender FROM messages "
-        "WHERE media_type = 'audio'"
+        "WHERE media_type = 'audio' "
+        "AND url != '' "
+        "AND length(media_key) > 0 "
+        "AND length(file_sha256) > 0 "
+        "AND length(file_enc_sha256) > 0 "
+        "AND file_length > 0"
     )
     params: list = []
     if chat:
