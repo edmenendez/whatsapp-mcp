@@ -40,8 +40,15 @@ def _content_and_join(attached: bool) -> tuple[str, str]:
     """
     if not attached:
         return "messages.content", ""
+    # Include user-typed caption (messages.content) alongside the AI
+    # description + OCR so caption-only search still hits on image rows.
+    # Newline between caption and description only when both are non-empty.
     overlay = (
         "NULLIF("
+        "COALESCE(messages.content, '') || "
+        "CASE WHEN COALESCE(messages.content, '') != '' "
+        "     AND im.image_descriptions.description IS NOT NULL "
+        "THEN char(10) ELSE '' END || "
         "COALESCE(im.image_descriptions.description, '') || "
         "CASE WHEN im.image_descriptions.ocr_text IS NOT NULL "
         "THEN char(10) || 'Text: ' || im.image_descriptions.ocr_text "
