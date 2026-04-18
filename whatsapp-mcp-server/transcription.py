@@ -163,6 +163,83 @@ def transcribe_audio(ogg_path: Path, model_path: str) -> tuple[str, str | None, 
     return text, language, duration
 
 
+def record_transcript(
+    conn: sqlite3.Connection,
+    message_id: str,
+    chat_jid: str,
+    audio_path: Path,
+    text: str,
+    language: str | None,
+    duration: float | None,
+    model_name: str,
+) -> None:
+    """Insert or replace a transcription row."""
+    conn.execute(
+        """INSERT OR REPLACE INTO transcriptions
+           (message_id, chat_jid, transcription, language, model, duration_sec, audio_sha256)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (message_id, chat_jid, text, language, model_name, duration, sha256_file(audio_path)),
+    )
+    conn.commit()
+
+
+def lookup_message_for_audio_file(audio_path: Path) -> tuple[str, str] | None:
+    """Given a store/<chat_jid>/audio_YYYYMMDD_HHMMSS.ogg path, return (message_id, chat_jid)."""
+    chat_jid = audio_path.parent.name
+    stem = audio_path.stem
+    if not stem.startswith("audio_"):
+        return None
+    ts_token = stem[len("audio_"):]
+
+    conn = sqlite3.connect(f"file:{messages_db_path()}?mode=ro", uri=True)
+    try:
+        for mid, ts_str in conn.execute(
+            "SELECT id, timestamp FROM messages WHERE media_type='audio' AND chat_jid=?",
+            (chat_jid,),
+        ):
+            try:
+                dt = datetime.fromisoformat(ts_str)
+            except (TypeError, ValueError):
+                continue
+            if dt.strftime("%Y%m%d_%H%M%S") == ts_token:
+                return mid, chat_jid
+    finally:
+        conn.close()
+    return None
+
+
+def already_transcribed(conn: sqlite3.Connection, message_id: str, chat_jid: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM transcriptions WHERE message_id=? AND chat_jid=? LIMIT 1",
+        (message_id, chat_jid),
+    ).fetchone()
+    return row is not None
+
+
+def transcribe_and_record(
+    conn: sqlite3.Connection,
+    message_id: str,
+    chat_jid: str,
+    audio_path: Path,
+    model_path: str,
+) -> tuple[str, str | None, float | None] | None:
+    """Transcribe audio and write to DB. Returns (text, language, duration) on success, None if empty."""
+    text, language, duration = transcribe_audio(audio_path, model_path)
+    if not text:
+        return None
+    record_transcript(
+        conn,
+        message_id,
+        chat_jid,
+        audio_path,
+        text,
+        language,
+        duration,
+        Path(model_path).name,
+    )
+    return text, language, duration
+
+
 def iter_untranscribed(
     msgs_conn: sqlite3.Connection,
     trans_conn: sqlite3.Connection,
@@ -217,7 +294,6 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     if args.dry_run:
         return 0
 
-    model_name = Path(model_path).name
     ok = skipped = failed = 0
     for message_id, chat_jid, timestamp, sender in targets:
         short_id = message_id[:12]
@@ -230,7 +306,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             print(f"[skip] {short_id} no audio file for {chat_jid} @ {timestamp}")
             continue
         try:
-            text, language, duration = transcribe_audio(audio, model_path)
+            result = transcribe_and_record(trans_conn, message_id, chat_jid, audio, model_path)
         except subprocess.CalledProcessError as e:
             failed += 1
             stderr = (e.stderr or b"").decode("utf-8", errors="replace")[:200] if isinstance(e.stderr, bytes) else (e.stderr or "")[:200]
@@ -241,18 +317,12 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             print(f"[fail] {short_id} {type(e).__name__}: {e}")
             continue
 
-        if not text:
+        if result is None:
             skipped += 1
             print(f"[skip] {short_id} empty transcript ({audio.name})")
             continue
 
-        trans_conn.execute(
-            """INSERT OR REPLACE INTO transcriptions
-               (message_id, chat_jid, transcription, language, model, duration_sec, audio_sha256)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (message_id, chat_jid, text, language, model_name, duration, sha256_file(audio)),
-        )
-        trans_conn.commit()
+        text, language, duration = result
         ok += 1
         dur = f"{duration:.1f}s" if duration else "?s"
         print(f"[ok] {short_id} {language or '?'} {dur} {len(text)}ch")
