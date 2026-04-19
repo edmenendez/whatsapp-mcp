@@ -1085,6 +1085,9 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Media retry endpoint — defined in mediaretry.go
+	registerRetryMediaEndpoint(client, messageStore)
+
 	// Health check endpoint
 	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1413,6 +1416,9 @@ func main() {
 
 		case *events.ClientOutdated:
 			logger.Errorf("❌ Client outdated - please update whatsmeow library")
+
+		case *events.MediaRetry:
+			handleMediaRetryEvent(context.Background(), client, messageStore, v, logger)
 		}
 	})
 
