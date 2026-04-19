@@ -127,11 +127,18 @@ func sendMediaRetryRequest(ctx context.Context, client *whatsmeow.Client, store 
 // On success it decrypts the new DirectPath, re-downloads the media, and
 // writes it to disk (which fires FSEvents for the watcher).
 func handleMediaRetryEvent(ctx context.Context, client *whatsmeow.Client, store *MessageStore, evt *events.MediaRetry, logger interface{ Warnf(string, ...any); Infof(string, ...any) }) {
-	// The event only carries message_id + chat_jid; we need the media_key
-	// from messages.db to decrypt the notification.
+	// Messages are stored under phone JIDs, but retry notifications can
+	// arrive addressed to the LID. Try the event's ChatID first; if that
+	// misses and the ChatID is a LID, resolve LID→phone via whatsmeow's
+	// LID store and retry the lookup.
 	info, err := loadRetryInfo(store, evt.MessageID, evt.ChatID.String())
+	if err != nil && evt.ChatID.Server == types.HiddenUserServer {
+		if pn, lidErr := client.Store.LIDs.GetPNForLID(ctx, evt.ChatID); lidErr == nil && !pn.IsEmpty() {
+			info, err = loadRetryInfo(store, evt.MessageID, pn.ToNonAD().String())
+		}
+	}
 	if err != nil {
-		logger.Warnf("media retry for %s: %v", evt.MessageID, err)
+		logger.Warnf("media retry for %s (chat=%s): %v", evt.MessageID, evt.ChatID, err)
 		return
 	}
 
