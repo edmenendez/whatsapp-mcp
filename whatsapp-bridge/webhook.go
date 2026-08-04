@@ -39,9 +39,13 @@ type WebhookPayload struct {
 
 // sendWebhookPayload marshals and POSTs a WebhookPayload to the configured webhook URL.
 func sendWebhookPayload(payload WebhookPayload) {
+	// An empty WEBHOOK_URL disables outbound webhooks entirely (the documented
+	// behavior). Previously this fell back to a hardcoded localhost:8769
+	// endpoint, so with no consumer running the bridge logged a
+	// connection-refused error on every single message.
 	webhookURL := os.Getenv("WEBHOOK_URL")
 	if webhookURL == "" {
-		webhookURL = "http://localhost:8769/whatsapp/webhook"
+		return
 	}
 
 	jsonData, err := json.Marshal(payload)
