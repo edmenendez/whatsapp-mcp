@@ -19,7 +19,9 @@ import base64
 import hashlib
 import os
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +34,10 @@ SCHEMA_SQL = HERE / "schema_image_descriptions.sql"
 DEFAULT_MODEL = os.environ.get("IMAGE_MODEL_NAME", "qwen3-vl:8b-instruct")
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://localhost:11434")
 BRIDGE_API_URL = os.environ.get("WHATSAPP_API_URL", "http://localhost:8080/api")
+
+# qwen3-vl uses a 16px patch size with 2x2 merging; anything thinner than the
+# resulting 32px stride crashes the model runner. Verified: 28px fails, 32px works.
+MIN_MODEL_DIMENSION = 32
 
 DESCRIBE_PROMPT = (
     'Describe this image in 1-2 sentences. Then, if any text is visible, '
@@ -294,6 +300,47 @@ def check_ollama_ready(model: str) -> str | None:
     return None
 
 
+def _model_safe_bytes(path: Path) -> bytes:
+    """Return image bytes safe to hand to the vision model.
+
+    qwen3-vl tiles images into 16px patches merged 2x2, so a side thinner than
+    32px yields a degenerate grid and takes the whole Ollama model runner down
+    with an HTTP 500 (not just this request). Pad such images onto a large
+    enough canvas first; the padding is inert whitespace and does not change
+    what the model reads.
+    """
+    raw = path.read_bytes()
+    width, height = image_dimensions(path)
+    if not width or not height or min(width, height) >= MIN_MODEL_DIMENSION:
+        return raw
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / f"padded{path.suffix or '.jpg'}"
+        try:
+            subprocess.run(
+                [
+                    "sips",
+                    "-p",
+                    str(max(height, MIN_MODEL_DIMENSION)),
+                    str(max(width, MIN_MODEL_DIMENSION)),
+                    str(path),
+                    "--out",
+                    str(out),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+            return out.read_bytes()
+        except (OSError, subprocess.SubprocessError) as e:
+            # Sending the original would crash the runner, so fail this one
+            # image loudly instead and leave the runner up for everything else.
+            raise RuntimeError(
+                f"cannot pad {width}x{height} image below the {MIN_MODEL_DIMENSION}px "
+                f"model minimum: {e}"
+            ) from e
+
+
 def describe_image(
     path: Path,
     model: str = DEFAULT_MODEL,
@@ -304,7 +351,7 @@ def describe_image(
     """
     import requests
 
-    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    b64 = base64.b64encode(_model_safe_bytes(path)).decode("ascii")
     payload = {
         "model": model,
         "prompt": DESCRIBE_PROMPT,
