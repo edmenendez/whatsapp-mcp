@@ -23,7 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -76,6 +76,29 @@ def sha256_file(path: Path) -> str:
         while chunk := f.read(1 << 16):
             h.update(chunk)
     return h.hexdigest()
+
+
+def within_max_age(timestamp: str, max_age_days: int | None) -> bool:
+    """Whether a message is recent enough that refetching its media can work.
+
+    WhatsApp expires media URLs, so asking the CDN for old messages returns 403
+    no matter how many times it is retried. Gating on age skips those instead of
+    spending the retry backoff on them.
+
+    Returns True when no cutoff is configured, and fails open on unparseable
+    timestamps: one wasted request is cheaper than silently skipping media that
+    could still have been recovered.
+    """
+    if max_age_days is None:
+        return True
+    try:
+        ts = datetime.fromisoformat(str(timestamp))
+    except (TypeError, ValueError):
+        return True
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    age_seconds = (datetime.now(UTC) - ts).total_seconds()
+    return age_seconds < max_age_days * 86400
 
 
 def download_via_bridge(message_id: str, chat_jid: str, max_retries: int = 2) -> Path | None:
@@ -504,7 +527,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     for message_id, chat_jid, timestamp, _sender in targets:
         short_id = message_id[:12]
         image = find_image_file(chat_jid, timestamp, message_id)
-        if not image and args.download:
+        if not image and args.download and within_max_age(timestamp, args.max_age_days):
             print(f"[dl]   {short_id} fetching from bridge...")
             image = download_via_bridge(message_id, chat_jid)
         if not image:
@@ -590,6 +613,12 @@ def build_parser() -> argparse.ArgumentParser:
     bf.add_argument("--limit", type=int, default=None, help="Max images to describe")
     bf.add_argument("--dry-run", action="store_true", help="Only list what would be described")
     bf.add_argument("--download", action="store_true", help="Fetch missing images from the Go bridge")
+    bf.add_argument(
+        "--max-age-days",
+        type=int,
+        default=None,
+        help="With --download, only fetch media newer than N days (older CDN URLs have expired)",
+    )
     bf.add_argument("--skip-status", action="store_true", help="Skip status@broadcast messages")
     bf.add_argument("--delay", type=float, default=0.0, help="Seconds to sleep between images (reduces WhatsApp CDN rate-limiting)")
     bf.set_defaults(func=cmd_backfill)
