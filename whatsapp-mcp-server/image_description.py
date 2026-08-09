@@ -35,6 +35,22 @@ DEFAULT_MODEL = os.environ.get("IMAGE_MODEL_NAME", "qwen3-vl:8b-instruct")
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://localhost:11434")
 BRIDGE_API_URL = os.environ.get("WHATSAPP_API_URL", "http://localhost:8080/api")
 
+
+def _bridge_headers() -> dict[str, str]:
+    """Bearer header for bridge REST calls, or {} when no token is configured.
+
+    Delegates to whatsapp.py so token resolution (WHATSAPP_BRIDGE_TOKEN, else
+    the generated .bridge-token file) stays defined in exactly one place.
+    Returns {} on import failure so a partial checkout degrades to the
+    pre-auth behavior rather than crashing the backfill.
+    """
+    try:
+        from whatsapp import _bridge_headers as _resolve
+    except Exception:
+        return {}
+    return _resolve()
+
+
 # qwen3-vl uses a 16px patch size with 2x2 merging; anything thinner than the
 # resulting 32px stride crashes the model runner. Verified: 28px fails, 32px works.
 MIN_MODEL_DIMENSION = 32
@@ -115,6 +131,7 @@ def download_via_bridge(message_id: str, chat_jid: str, max_retries: int = 2) ->
             resp = requests.post(
                 f"{BRIDGE_API_URL}/download",
                 json={"message_id": message_id, "chat_jid": chat_jid},
+                headers=_bridge_headers(),
                 timeout=60,
             )
         except requests.RequestException as e:

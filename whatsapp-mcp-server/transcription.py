@@ -38,6 +38,21 @@ DEFAULT_MODEL = os.environ.get(
 BRIDGE_API_URL = os.environ.get("WHATSAPP_API_URL", "http://localhost:8080/api")
 
 
+def _bridge_headers() -> dict[str, str]:
+    """Bearer header for bridge REST calls, or {} when no token is configured.
+
+    Delegates to whatsapp.py so token resolution (WHATSAPP_BRIDGE_TOKEN, else
+    the generated .bridge-token file) stays defined in exactly one place.
+    Returns {} on import failure so a partial checkout degrades to the
+    pre-auth behavior rather than crashing the backfill.
+    """
+    try:
+        from whatsapp import _bridge_headers as _resolve
+    except Exception:
+        return {}
+    return _resolve()
+
+
 def messages_db_path() -> Path:
     return Path(os.environ.get("WHATSAPP_DB_PATH", str(DEFAULT_MESSAGES_DB)))
 
@@ -84,6 +99,7 @@ def download_via_bridge(message_id: str, chat_jid: str) -> Path | None:
         resp = requests.post(
             f"{BRIDGE_API_URL}/download",
             json={"message_id": message_id, "chat_jid": chat_jid},
+            headers=_bridge_headers(),
             timeout=60,
         )
     except requests.RequestException as e:
