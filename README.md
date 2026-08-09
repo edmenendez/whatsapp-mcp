@@ -3,11 +3,19 @@
 [![CI](https://github.com/verygoodplugins/whatsapp-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/verygoodplugins/whatsapp-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Go 1.24+](https://img.shields.io/badge/go-1.24+-00ADD8.svg)](https://go.dev/)
+[![Go 1.25+](https://img.shields.io/badge/go-1.25+-00ADD8.svg)](https://go.dev/)
 
 A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and send WhatsApp messages.
 
 > Originally created by [Luke Harries](https://github.com/lharries/whatsapp-mcp). Maintained by [Very Good Plugins](https://verygoodplugins.com/?utm_source=github).
+
+<p align="center">
+  <a href="https://github.com/user-attachments/assets/9475af1d-2369-4315-9ccc-823dba2c5c32"><strong>Watch the WhatsApp MCP demo video</strong></a>
+</p>
+
+<p align="center">
+  <sub>Product demo generated with Remotion using simulated data.</sub>
+</p>
 
 ## Features
 
@@ -23,7 +31,7 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.25+
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) package manager
 - Claude Desktop or Cursor
@@ -45,7 +53,9 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
    go run .
    ```
 
-   Scan the QR code with WhatsApp on your phone to authenticate.
+   On first start, the bridge prints and stores a local REST API token at
+   `whatsapp-bridge/store/.bridge-token`. Scan the QR code with WhatsApp on
+   your phone to authenticate.
 
 3. **Configure Claude Desktop**
 
@@ -86,6 +96,11 @@ git pull
 | **MCP server** (`whatsapp-mcp-server/*.py`, `pyproject.toml`, `uv.lock`) | Restart Claude Desktop / Cursor — `uv` re-resolves from the lockfile on next launch. Force a sync with `cd whatsapp-mcp-server && uv sync` if needed. |
 
 Updates do **not** require re-pairing or deleting `whatsapp.db` — your session and message history are preserved. Re-pairing is only needed when explicitly requesting full history (see [Requesting full history](#requesting-full-history)).
+
+For `v0.2.1` and later, restart both the bridge and MCP server after updating
+so the MCP server can read the bridge token. If the two components do not share
+the same checkout, set the same `WHATSAPP_BRIDGE_TOKEN` value in both
+environments.
 
 ### Cursor IDE Configuration
 
@@ -166,17 +181,60 @@ Get messages with filters, date ranges, and sorting.
 
 #### `send_message`
 
-Send a text message to a contact or group.
+Send a text message to a contact or group, optionally as a quoted reply.
 
 **Parameters:**
 
 - `recipient` (required): Phone number or group JID
 - `message` (required): Text content to send
+- `quoted_message_id` (optional): ID of the message to reply to. When provided, the sent message appears as a quoted reply in WhatsApp.
+- `quoted_sender_jid` (optional): Full JID of the author of the quoted message. Required for group replies so WhatsApp renders the correct attribution header.
+- `quoted_content` (optional): Text content of the quoted message, used for the reply preview. Only plain text is supported.
+- `mentions` (optional): List of users to @-mention, as phone numbers with country code (e.g. `["12025551234"]`) or JIDs. For each entry the message text must contain a matching `@<number>` token (e.g. `"thanks @12025551234!"`), which recipients' devices render as a highlighted, tappable mention that also notifies the user. Only meaningful in group chats.
+
+Inbound quoted replies are stored automatically. The `quoted_message_id` field in each message returned by `list_messages` indicates which message it is replying to (or `null` for non-replies).
 
 **Natural Language Examples:**
 
 - "Send 'Hello!' to +1234567890"
 - "Message the team group saying 'Meeting at 3pm'"
+- "Reply to that message saying 'Sounds good'"
+
+#### `send_reaction`
+
+Send (or remove) an emoji reaction to a message.
+
+**Parameters:**
+
+- `recipient` (required): Chat JID the message belongs to (phone JID or group JID)
+- `message_id` (required): ID of the message to react to
+- `emoji` (required): Reaction emoji (e.g. `"👍"`). Pass an empty string `""` to remove an existing reaction.
+- `from_me` (optional, default `false`): Whether the original message was sent by the current user
+- `sender_jid` (optional): Full JID of the original message sender — required for group messages when `from_me` is `false` so the correct WhatsApp key is built
+
+Inbound reactions received from others are stored automatically as messages with `media_type = "reaction"`. The `reaction_to_message_id` field in each reaction message indicates which message was reacted to.
+
+When webhook forwarding is enabled, inbound reactions are also posted to `WEBHOOK_URL` as typed events. Reaction removals use an empty `content`/`reactionEmoji` and `reactionRemoved: true`.
+
+```json
+{
+  "eventType": "reaction",
+  "sender": "15551234567",
+  "chatJID": "15551234567@s.whatsapp.net",
+  "isFromMe": true,
+  "content": "👍",
+  "messageId": "reaction-stanza-id",
+  "mediaType": "reaction",
+  "reactionToMessageId": "target-message-id",
+  "reactionEmoji": "👍",
+  "reactionRemoved": false
+}
+```
+
+**Natural Language Examples:**
+
+- "React to that message with a thumbs up"
+- "Remove my reaction from the last message in the group chat"
 
 #### `send_file`
 
@@ -188,6 +246,10 @@ Send a media file (image, video, document).
 - `file_path` (required): Path to the file
 - `caption` (optional): Caption for the media
 
+The bridge only reads files inside configured media roots. By default this is
+`~/.local/share/whatsapp-mcp/outbox`; set `WHATSAPP_MEDIA_ROOTS` to allow
+additional absolute directories.
+
 #### `send_audio_message`
 
 Send a voice message (automatically converts to Opus .ogg format).
@@ -196,6 +258,9 @@ Send a voice message (automatically converts to Opus .ogg format).
 
 - `recipient` (required): Phone number or group JID
 - `file_path` (required): Path to audio file
+
+Converted audio is sent through the same media-path confinement as
+`send_file`.
 
 #### `download_media`
 
@@ -267,10 +332,134 @@ Copy `.env.example` to `.env` and configure as needed:
 | ---------------------- | ---------------------------------------- | -------------------------------------------- |
 | `WHATSAPP_BRIDGE_PORT` | `8080`                                   | Port for Go bridge REST API                  |
 | `WEBHOOK_URL`          | `http://localhost:8769/whatsapp/webhook` | Webhook for incoming messages                |
-| `FORWARD_SELF`         | `false`                                  | Forward messages sent by self                |
+| `FORWARD_SELF`         | `true`                                   | Forward messages sent by self                |
 | `WHATSAPP_DB_PATH`     | `../whatsapp-bridge/store/messages.db`   | Path to SQLite database                      |
 | `WHATSMEOW_DB_PATH`    | `../whatsapp-bridge/store/whatsapp.db`   | whatsmeow DB used for LID ↔ phone resolution |
 | `WHATSAPP_API_URL`     | `http://localhost:8080/api`              | Go bridge REST API URL                       |
+| `WHATSAPP_BRIDGE_TOKEN` | generated next to `WHATSMEOW_DB_PATH` as `.bridge-token` | Bearer token for bridge REST calls; also signed onto outbound webhook POSTs |
+| `WHATSAPP_MEDIA_ROOTS` | `~/.local/share/whatsapp-mcp/outbox`     | Path-list of directories allowed for outbound media files |
+| `WHATSAPP_DEVICE_NAME` | `whatsmeow` (whatsmeow default)          | Label shown for this connection under WhatsApp > Linked Devices. Set to a recognisable name. Applies at pair time only (re-pair to change) |
+| `WHATSAPP_MCP_TRANSPORT` | `stdio`                                | MCP transport to serve clients: `stdio`, `http`, or `sse` |
+| `WHATSAPP_MCP_HOST`    | `127.0.0.1`                              | Bind address for the `http`/`sse` transports |
+| `WHATSAPP_MCP_PORT`    | `8000`                                   | Port for the `http`/`sse` transports |
+| `WHATSAPP_PARENT_WATCHDOG_S` | `30`                              | Stdio parent-liveness poll interval (seconds); exits on parent reparent only |
+
+### MCP transport (stdio vs http/sse)
+
+By default the server speaks MCP over **stdio**, which is what local clients
+like Claude Desktop and Cursor launch. To serve the server over the network
+instead, set `WHATSAPP_MCP_TRANSPORT`:
+
+```bash
+# Streamable HTTP (current spec transport for remote MCP), endpoint at /mcp
+WHATSAPP_MCP_TRANSPORT=http WHATSAPP_MCP_PORT=8000 uv run main.py
+
+# Legacy Server-Sent Events transport (deprecated in the MCP spec), endpoint at /sse
+WHATSAPP_MCP_TRANSPORT=sse uv run main.py
+```
+
+`http` is an alias for the spec's `streamable-http` transport and is the
+recommended choice for remote connections; `sse` is kept for older clients.
+
+> **Security:** `WHATSAPP_MCP_HOST` defaults to `127.0.0.1`, so the HTTP/SSE
+> server is reachable only from the local machine. The server has no built-in
+> authentication, and the underlying bridge can read and send WhatsApp messages
+> on your account. Only bind to a non-loopback address (e.g. `0.0.0.0`) if you
+> place an authenticating reverse proxy or tunnel in front of it.
+
+### Bridge authentication and media paths
+
+The bridge requires bearer-token authentication for every `/api/*` request and
+accepts only exact loopback Host headers for its configured port. This protects
+the local REST API from other local processes and browser DNS-rebinding attacks.
+
+On first start, the bridge generates a 256-bit token, writes it to
+`.bridge-token` in the active bridge store directory with owner-only
+permissions, and prints a setup banner. The MCP server reads
+`WHATSAPP_BRIDGE_TOKEN` first, then falls back to `.bridge-token` in the same
+directory as `WHATSMEOW_DB_PATH`. For split deployments, containers, or process
+managers that do not share the store directory, set the same
+`WHATSAPP_BRIDGE_TOKEN` value for both the bridge and MCP server.
+
+The bridge also signs its **outbound** webhook POSTs (to `WEBHOOK_URL`) with this
+same token, sent as an `X-Bridge-Token: <token>` header — a dedicated header
+rather than `Authorization`, so it never collides with a receiver's own
+Authorization-based auth (e.g. HTTP Basic auth embedded in `WEBHOOK_URL` as
+`http://user:pass@host/...`, which `net/http` applies automatically as long as
+the bridge doesn't set its own `Authorization` header). The header is attached only when a token is configured **and** `WEBHOOK_URL` was
+explicitly set — never to the built-in local default. The bridge token also
+authorizes `/api/*` calls like sending messages, and nothing has vetted the
+implicit default address, so it must never be handed to whatever process
+happens to be listening there. Upgrades that predate the token rollout, or
+that never set `WEBHOOK_URL`, keep working unchanged. The webhook client also
+never follows redirects, so a misconfigured or malicious endpoint can't
+redirect the bridge into leaking the token to a different host. If your
+webhook receiver enforces the token, set its copy to this exact value: e.g.
+the AutoHub hub's `WHATSAPP_BRIDGE_TOKEN` must equal this bridge's token (from
+`.bridge-token` or its own env) — the hub accepts it via `X-Bridge-Token` or
+`Authorization: Bearer`. The bridge always sends the token it has; the hub
+rejects unauthenticated forwards only once its `WHATSAPP_BRIDGE_TOKEN` is set
+to the matching value.
+
+Outbound `media_path` values are confined to `WHATSAPP_MEDIA_ROOTS`. The default
+outbox is `~/.local/share/whatsapp-mcp/outbox`, created on bridge startup. Move
+files there before calling `send_file` or `send_audio_message`, or set
+`WHATSAPP_MEDIA_ROOTS` to a colon-separated list of absolute directories.
+
+### Run automatically on macOS
+
+macOS users can install optional per-user `launchd` jobs that start the Go
+bridge at login and monitor it every 60 seconds for API health, disconnects, and
+QR relink signals. The installer does not require `sudo` and does not install or
+start the MCP server.
+
+```bash
+scripts/install-launchd-macos.sh
+```
+
+The installer builds `whatsapp-bridge/whatsapp-bridge` with `go build` when Go is
+available, writes generated support files to
+`~/Library/Application Support/whatsapp-mcp/`, writes LaunchAgents to
+`~/Library/LaunchAgents/`, and writes logs to `~/Library/Logs/whatsapp-mcp/`.
+It safely reloads only these labels:
+
+- `com.whatsapp-mcp.bridge`
+- `com.whatsapp-mcp.bridge-monitor`
+
+To customize the launchd environment, export values before running the installer.
+Re-run the installer after changing them.
+
+```bash
+export WHATSAPP_BRIDGE_PORT=8080
+export WEBHOOK_URL=http://localhost:8769/whatsapp/webhook
+export FORWARD_SELF=false
+export WHATSAPP_MEDIA_ROOTS="$HOME/.local/share/whatsapp-mcp/outbox"
+scripts/install-launchd-macos.sh
+```
+
+Verify the jobs and inspect logs:
+
+```bash
+launchctl print gui/$(id -u)/com.whatsapp-mcp.bridge
+launchctl print gui/$(id -u)/com.whatsapp-mcp.bridge-monitor
+tail -n 100 ~/Library/Logs/whatsapp-mcp/bridge.err.log
+tail -n 100 ~/Library/Logs/whatsapp-mcp/monitor.err.log
+```
+
+The monitor sends a macOS notification once per failure type until recovery. It
+alerts when the bridge LaunchAgent is unloaded, the token is missing, the health
+endpoint is unreachable, WhatsApp is disconnected, or recent logs indicate that
+QR relinking is needed.
+
+Uninstall the generated LaunchAgents and support files with:
+
+```bash
+scripts/uninstall-launchd-macos.sh
+```
+
+Uninstall preserves `whatsapp-bridge/store/`, including WhatsApp session DBs,
+message DBs, media, and `.bridge-token`. Logs are left in
+`~/Library/Logs/whatsapp-mcp/` for manual cleanup.
 
 ### CLI flags (Go bridge)
 
@@ -284,7 +473,7 @@ whatsmeow's default pairing asks for "recent sync" — roughly the last 3 months
 
 ```bash
 # Stop the bridge
-launchctl bootout gui/$UID/com.whatsapp-bridge    # or however you manage it
+launchctl bootout gui/$UID/com.whatsapp-mcp.bridge    # or however you manage it
 
 # Back up, then remove the auth session (keeps messages.db intact)
 cp whatsapp-bridge/store/whatsapp.db{,.bak}
@@ -303,6 +492,38 @@ Caveats:
 - **The phone decides the actual cap.** The flag requests up to 10 years / 100 GB, but WhatsApp's iOS primary device enforces its own retention policy. iPad companion is documented at ~1 year max; other linked devices appear to follow similar logic.
 - **Only effective on a fresh pair.** With `whatsapp.db` already present, no new pair handshake fires and the flag is a no-op.
 - **Messages the phone has deleted are not recoverable** — auto-expire, low-storage cleanup, and manual delete all leave no trace for the phone to share.
+
+### Requesting history for a single chat (on-demand)
+
+`--full-history-pair` only applies to a fresh pair, so recovering a gap in one
+chat otherwise means deleting `whatsapp.db` and re-syncing everything. To ask
+the phone for older messages in a single chat *without* re-pairing:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/history \
+  -H "Authorization: Bearer $(cat whatsapp-bridge/store/.bridge-token)" \
+  -H "Content-Type: application/json" \
+  -d '{"chat_jid": "1234567890@s.whatsapp.net", "count": 50}'
+```
+
+The request is anchored on the **oldest message already stored** for that chat,
+so the phone returns messages from before it. Call it repeatedly to page
+further back. Results arrive asynchronously through the normal history-sync
+handler and land in `messages.db` — typically within a few seconds.
+
+| Field | Required | Description |
+| --------- | -------- | ------------------------------------------------------ |
+| `chat_jid` | yes | Chat to backfill (`...@s.whatsapp.net` or `...@g.us`) |
+| `count` | no | Messages to request; default `50`, capped at `500` |
+
+Caveats:
+
+- **The phone decides how much it returns**, exactly as with pair-time sync, so
+  `count` is a request rather than a guarantee.
+- **At least one message for the chat must already be stored**, since it is used
+  as the anchor. Chats with no local messages return `404`; send or receive one
+  message first.
+- Messages the phone has deleted are not recoverable, as above.
 
 ## Call History
 
@@ -463,7 +684,9 @@ flowchart LR
         direction TB
         SEND["/api/send"]
         DOWN["/api/download"]
+        REACT["/api/react"]
         TYPE["/api/typing"]
+        HIST["/api/history"]
         HEALTH["/api/health"]
     end
 
@@ -562,10 +785,64 @@ are documented in [docs/RELEASING.md](docs/RELEASING.md).
 
 ### Authentication Issues
 
+- **Pairing fails with `Client outdated` or HTTP 405**: Update to the latest
+  release and rebuild the bridge. WhatsApp periodically raises the minimum
+  supported linked-device client version, which can make older whatsmeow builds
+  fail before pairing completes.
 - **QR Code Not Displaying**: Restart the bridge. Check terminal QR code support.
 - **Device Limit Reached**: Remove a linked device from WhatsApp Settings > Linked Devices.
 - **No Messages Loading**: Initial sync can take several minutes for large chat histories.
-- **Out of Sync**: Delete `whatsapp-bridge/store/*.db` files and re-authenticate.
+- **Out of Sync**: Back up `whatsapp-bridge/store`, then move
+  `whatsapp-bridge/store/whatsapp.db` aside and re-authenticate. Keep
+  `messages.db` unless you intentionally want to discard local message history.
+- **Bridge returns 401 Unauthorized**: Restart the bridge so it creates
+  `.bridge-token` next to `WHATSMEOW_DB_PATH`, then restart the MCP server. If
+  the MCP server cannot read that file, set `WHATSAPP_BRIDGE_TOKEN` to the same
+  value in both environments.
+- **Bridge returns 403 Forbidden for Host**: Use `WHATSAPP_API_URL` with
+  `http://127.0.0.1:<port>/api`, `http://localhost:<port>/api`, or
+  `http://[::1]:<port>/api`; custom hostnames and missing ports are rejected.
+- **Bridge returns 403 Forbidden for media_path**: Move the file into
+  `~/.local/share/whatsapp-mcp/outbox` or add its absolute parent directory to
+  `WHATSAPP_MEDIA_ROOTS`.
+
+### App State / LTHash Conflicts
+
+Some WhatsApp account state is managed by whatsmeow in
+`whatsapp-bridge/store/whatsapp.db`. If the bridge reports errors like:
+
+```text
+SendAppState failed: server returned error updating app state (regular_low):
+<error code="409" text="conflict"/>
+failed to verify patch v12345: mismatching LTHash
+```
+
+then WhatsApp's app-state patch chain for the linked device is out of sync.
+This usually affects operations that write chat settings such as archive,
+mute, or pin state. Incoming and outgoing messages may still work because
+message storage lives separately in `messages.db`.
+
+Known manual resync attempts such as `FetchAppState(..., fullSync=true)` may
+still fail on this upstream app-state error class. The practical recovery path
+is to reset the whatsmeow session and re-pair:
+
+```bash
+# Stop the bridge first.
+launchctl bootout gui/$UID/com.whatsapp-mcp.bridge    # or however you manage it
+
+# Back up the whole runtime store.
+cp -a whatsapp-bridge/store whatsapp-bridge/store.bak.$(date +%Y%m%d%H%M%S)
+
+# Reset only the whatsmeow session/app-state DB.
+mv whatsapp-bridge/store/whatsapp.db whatsapp-bridge/store/whatsapp.db.lthash.bak
+
+# Restart the bridge and scan the new QR code.
+cd whatsapp-bridge
+./whatsapp-bridge    # or `go run .` during development
+```
+
+Do not remove `whatsapp-bridge/store/messages.db` for this recovery unless you
+also want to delete the local message archive.
 
 ### Windows
 

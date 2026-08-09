@@ -11,13 +11,14 @@ import requests
 import audio
 
 # Configuration via environment variables with sensible defaults
+_DEFAULT_BRIDGE_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store")
 MESSAGES_DB_PATH = os.getenv(
     "WHATSAPP_DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store", "messages.db"),
+    os.path.join(_DEFAULT_BRIDGE_STORE_DIR, "messages.db"),
 )
 WHATSMEOW_DB_PATH = os.getenv(
     "WHATSMEOW_DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store", "whatsapp.db"),
+    os.path.join(_DEFAULT_BRIDGE_STORE_DIR, "whatsapp.db"),
 )
 WHATSAPP_API_BASE_URL = os.getenv("WHATSAPP_API_URL", "http://localhost:8080/api")
 TRANSCRIPTIONS_DB_PATH = os.getenv(
@@ -91,6 +92,29 @@ def _content_and_join(tx_attached: bool, im_attached: bool) -> tuple[str, str]:
 
     return f"COALESCE({', '.join(overlays)}, messages.content)", " ".join(joins)
 
+_BRIDGE_TOKEN_PATH = os.path.join(os.path.dirname(WHATSMEOW_DB_PATH), ".bridge-token")
+
+
+def _read_bridge_token() -> str | None:
+    env = os.getenv("WHATSAPP_BRIDGE_TOKEN", "").strip()
+    if env:
+        return env
+    try:
+        with open(_BRIDGE_TOKEN_PATH, encoding="utf-8") as fh:
+            value = fh.read().strip()
+            return value or None
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+def _bridge_headers() -> dict[str, str]:
+    token = _read_bridge_token()
+    if not token:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
+
 
 @dataclass
 class Message:
@@ -102,6 +126,11 @@ class Message:
     id: str
     chat_name: str | None = None
     media_type: str | None = None
+    # For media_type == "reaction", the bridge stores the reacted-to message ID
+    # in the `filename` column. Exposed to callers as `reaction_to_message_id`.
+    filename: str | None = None
+    # ID of the message this one is replying to (NULL for non-replies).
+    quoted_message_id: str | None = None
 
 
 @dataclass
@@ -166,6 +195,8 @@ def msg_to_dict(message: Message, include_sender_name: bool = True) -> dict[str,
         "chat_jid": message.chat_jid,
         "chat_name": message.chat_name,
         "media_type": message.media_type,
+        "reaction_to_message_id": (message.filename if message.media_type == "reaction" else None),
+        "quoted_message_id": message.quoted_message_id,
     }
 
 
@@ -432,7 +463,7 @@ def list_messages(
 
         # Build base query
         query_parts = [
-            f"SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"
+            f"SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename FROM messages"
         ]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         if join_clause:
@@ -501,6 +532,8 @@ def list_messages(
                 chat_jid=msg[5],
                 id=msg[6],
                 media_type=msg[7],
+                quoted_message_id=msg[8] if len(msg) > 8 else None,
+                filename=msg[9] if len(msg) > 9 else None,
             )
             result.append(message)
 
@@ -549,7 +582,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
         # Get the target message first
         cursor.execute(
             f"""
-            SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.quoted_message_id, messages.filename
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid{maybe_join}
             WHERE messages.id = ?
@@ -570,12 +603,14 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
             chat_jid=msg_data[5],
             id=msg_data[6],
             media_type=msg_data[8],
+            quoted_message_id=msg_data[9] if len(msg_data) > 9 else None,
+            filename=msg_data[10] if len(msg_data) > 10 else None,
         )
 
         # Get messages before
         cursor.execute(
             f"""
-            SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid{maybe_join}
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
@@ -597,13 +632,15 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
                     chat_jid=msg[5],
                     id=msg[6],
                     media_type=msg[7],
+                    quoted_message_id=msg[8] if len(msg) > 8 else None,
+                    filename=msg[9] if len(msg) > 9 else None,
                 )
             )
 
         # Get messages after
         cursor.execute(
             f"""
-            SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, {content_expr}, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.quoted_message_id, messages.filename
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid{maybe_join}
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
@@ -625,6 +662,8 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
                     chat_jid=msg[5],
                     id=msg[6],
                     media_type=msg[7],
+                    quoted_message_id=msg[8] if len(msg) > 8 else None,
+                    filename=msg[9] if len(msg) > 9 else None,
                 )
             )
 
@@ -654,16 +693,27 @@ def list_chats(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
-        # Build base query
+        # Build base query. The last-message columns are referenced by tuple
+        # index downstream, so we keep the result shape constant and emit
+        # static NULLs when the messages table is not joined — otherwise the
+        # SELECT references messages.* with no FROM/JOIN and SQLite errors
+        # out with "no such column: messages.content".
+        if include_last_message:
+            last_message_select = (
+                "messages.content as last_message, "
+                "messages.sender as last_sender, "
+                "messages.is_from_me as last_is_from_me"
+            )
+        else:
+            last_message_select = "NULL as last_message, NULL as last_sender, NULL as last_is_from_me"
+
         query_parts = [
-            """
+            f"""
             SELECT
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                {last_message_select}
             FROM chats
         """
         ]
@@ -814,12 +864,18 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
                 c.jid,
                 c.name,
                 c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                last_msg.content as last_message,
+                last_msg.sender as last_sender,
+                last_msg.is_from_me as last_is_from_me
             FROM chats c
-            JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender IN ({placeholders}) OR c.jid = ?
+            LEFT JOIN messages last_msg ON c.jid = last_msg.chat_jid
+                AND c.last_message_time = last_msg.timestamp
+            WHERE EXISTS (
+                SELECT 1
+                FROM messages contact_msg
+                WHERE contact_msg.chat_jid = c.jid
+                    AND contact_msg.sender IN ({placeholders})
+            ) OR c.jid = ?
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
         """,
@@ -921,14 +977,20 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
-        query = """
+        # See list_chats: keep result tuple shape stable across the
+        # include_last_message branch by emitting static NULLs when we
+        # don't JOIN the messages table.
+        if include_last_message:
+            last_message_select = "m.content as last_message, m.sender as last_sender, m.is_from_me as last_is_from_me"
+        else:
+            last_message_select = "NULL as last_message, NULL as last_sender, NULL as last_is_from_me"
+
+        query = f"""
             SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                {last_message_select}
             FROM chats c
         """
 
@@ -1011,19 +1073,32 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
             conn.close()
 
 
-def send_message(recipient: str, message: str) -> tuple[bool, str]:
+def send_message(
+    recipient: str,
+    message: str,
+    quoted_message_id: str = "",
+    quoted_sender_jid: str = "",
+    quoted_content: str = "",
+    mentions: list[str] | None = None,
+) -> tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {
+        payload: dict[str, Any] = {
             "recipient": recipient,
             "message": message,
         }
+        if quoted_message_id:
+            payload["quoted_message_id"] = quoted_message_id
+            payload["quoted_sender_jid"] = quoted_sender_jid
+            payload["quoted_content"] = quoted_content
+        if mentions:
+            payload["mentions"] = mentions
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_bridge_headers())
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -1055,7 +1130,7 @@ def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {"recipient": recipient, "media_path": media_path}
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_bridge_headers())
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -1093,12 +1168,65 @@ def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {"recipient": recipient, "media_path": media_path}
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_bridge_headers())
 
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def send_reaction(
+    recipient: str,
+    message_id: str,
+    emoji: str,
+    from_me: bool = False,
+    sender_jid: str = "",
+) -> tuple[bool, str]:
+    """Send (or remove) a reaction to a WhatsApp message.
+
+    Args:
+        recipient: The chat JID the message belongs to (phone JID or group JID).
+        message_id: The ID of the message to react to.
+        emoji: The reaction emoji. Pass an empty string to remove an existing reaction.
+        from_me: Whether the original message was sent by the current user.
+        sender_jid: JID of the original message sender (required for group messages
+                    when from_me is False so the bridge can build the correct key).
+
+    Returns:
+        Tuple of (success, status_message).
+    """
+    try:
+        if not recipient:
+            return False, "Recipient must be provided"
+        if not message_id:
+            return False, "Message ID must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/react"
+        payload: dict[str, Any] = {
+            "recipient": recipient,
+            "message_id": message_id,
+            "emoji": emoji,
+            "from_me": from_me,
+            "sender_jid": sender_jid,
+        }
+
+        response = requests.post(url, json=payload, headers=_bridge_headers())
+
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("ok"):
+                return True, "Reaction sent"
+            return False, result.get("error", "Unknown error")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
 
@@ -1124,7 +1252,7 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
         url = f"{WHATSAPP_API_BASE_URL}/download"
         payload = {"message_id": message_id, "chat_jid": chat_jid}
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_bridge_headers())
 
         if response.status_code == 200:
             result = response.json()

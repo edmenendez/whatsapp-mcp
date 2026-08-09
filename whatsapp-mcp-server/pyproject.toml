@@ -1,6 +1,6 @@
 [project]
 name = "whatsapp-mcp-server"
-version = "0.2.0"
+version = "0.5.1"
 description = "WhatsApp integration for Claude via Model Context Protocol (MCP)"
 requires-python = ">=3.11"
 license = "MIT"
@@ -16,9 +16,13 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
+    # cryptography 49+ no longer publishes Intel macOS wheels. Keep the
+    # developer-laptop install path working until the project deliberately
+    # drops x86_64 macOS support.
+    "cryptography>=48.0.1,<49",
     "httpx>=0.28.1",
-    "mcp[cli]>=1.27.0",
-    "requests>=2.33.1",
+    "mcp[cli]>=1.28.1,<2",
+    "requests>=2.34.2",
     "anyio<4.14",
     "watchdog>=6.0.0",
 ]
@@ -26,8 +30,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.3",
-    "pytest-asyncio>=1.3.0",
-    "ruff>=0.15.11",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.15.15",
 ]
 
 [project.urls]
@@ -36,7 +40,7 @@ Repository = "https://github.com/verygoodplugins/whatsapp-mcp"
 Issues = "https://github.com/verygoodplugins/whatsapp-mcp/issues"
 
 [tool.setuptools]
-py-modules = ["main", "whatsapp", "audio", "image_description", "watch_images"]
+py-modules = ["main", "whatsapp", "audio", "mcp_config", "parent_watchdog", "image_description", "watch_images"]
 
 [tool.mcp]
 name = "io.github.verygoodplugins/whatsapp-mcp"
@@ -64,4 +68,5 @@ indent-style = "space"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 asyncio_mode = "auto"

@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,7 +29,15 @@ import (
 // mockLIDStore implements store.LIDStore with a simple in-memory map.
 type mockLIDStore struct {
 	store.NoopStore
+	lidByPN map[types.JID]types.JID
 	pnByLID map[types.JID]types.JID
+}
+
+func (m *mockLIDStore) GetLIDForPN(_ context.Context, pn types.JID) (types.JID, error) {
+	if lid, ok := m.lidByPN[pn]; ok {
+		return lid, nil
+	}
+	return types.EmptyJID, nil
 }
 
 func (m *mockLIDStore) GetPNForLID(_ context.Context, lid types.JID) (types.JID, error) {
@@ -76,7 +86,9 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 		CREATE TABLE chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			ephemeral_expiration INTEGER NOT NULL DEFAULT 0,
+			ephemeral_setting_timestamp INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE TABLE messages (
 			id TEXT,
@@ -92,6 +104,8 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			deleted_at TIMESTAMP,
+			quoted_message_id TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -115,6 +129,360 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return &MessageStore{db: db}
+}
+
+func TestOpenWhatsmeowContactsDB_MissingPathDoesNotCreateDB(t *testing.T) {
+	missingPath := filepath.Join(t.TempDir(), "whatsapp.db")
+
+	db, err := openWhatsmeowContactsDB(missingPath)
+	if err != nil {
+		t.Fatalf("openWhatsmeowContactsDB returned error: %v", err)
+	}
+	if db != nil {
+		t.Fatalf("expected missing DB to return nil handle")
+	}
+	if _, err := os.Stat(missingPath); !os.IsNotExist(err) {
+		t.Fatalf("expected missing DB path to stay absent, stat error: %v", err)
+	}
+}
+
+func TestOpenWhatsmeowContactsDB_ReadOnly(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "whatsapp.db")
+	seedDB, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("open seed db: %v", err)
+	}
+	if _, err := seedDB.Exec("CREATE TABLE marker (id INTEGER)"); err != nil {
+		t.Fatalf("create marker table: %v", err)
+	}
+	if err := seedDB.Close(); err != nil {
+		t.Fatalf("close seed db: %v", err)
+	}
+
+	db, err := openWhatsmeowContactsDB(dbPath)
+	if err != nil {
+		t.Fatalf("openWhatsmeowContactsDB returned error: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("INSERT INTO marker (id) VALUES (1)"); err == nil {
+		t.Fatalf("expected read-only whatsmeow DB handle to reject writes")
+	}
+}
+
+func TestExtractDirectPathFromURL(t *testing.T) {
+	cases := []struct {
+		name                   string
+		input                  string
+		want                   string
+		requireSingleSlashPath bool
+	}{
+		{
+			name:                   "preserves WhatsApp CDN auth query",
+			input:                  "https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=01_Q5Aa&oe=6854A1B2",
+			want:                   "/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=01_Q5Aa&oe=6854A1B2",
+			requireSingleSlashPath: true,
+		},
+		{
+			name:  "keeps fallback for URLs without WhatsApp CDN marker",
+			input: "https://example.com/v/t62.7118-24/file.enc?ccb=11-4&oh=01_Q5Aa&oe=6854A1B2",
+			want:  "https://example.com/v/t62.7118-24/file.enc?ccb=11-4&oh=01_Q5Aa&oe=6854A1B2",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractDirectPathFromURL(tc.input)
+			if got != tc.want {
+				t.Fatalf("extractDirectPathFromURL(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+			if tc.requireSingleSlashPath && (!strings.HasPrefix(got, "/") || strings.HasPrefix(got, "//")) {
+				t.Fatalf("expected exactly one leading slash in %q", got)
+			}
+		})
+	}
+}
+
+func TestSendHandlerLogsCallerBeforeDecode(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create stdout pipe: %v", err)
+	}
+	oldStdout := os.Stdout
+	os.Stdout = writePipe
+	t.Cleanup(func() {
+		os.Stdout = oldStdout
+		_ = writePipe.Close()
+		_ = readPipe.Close()
+	})
+
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/send", strings.NewReader("{"))
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "unit-test-fingerprint")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	os.Stdout = oldStdout
+	_ = writePipe.Close()
+	outputBytes, readErr := io.ReadAll(readPipe)
+	_ = readPipe.Close()
+	if readErr != nil {
+		t.Fatalf("failed to read captured stdout: %v", readErr)
+	}
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("expected malformed body to return 400, got %d", resp.Code)
+	}
+
+	output := string(outputBytes)
+	if !strings.Contains(output, "→ /api/send from=") {
+		t.Fatalf("expected caller fingerprint log, got output %q", output)
+	}
+	if !strings.Contains(output, `user_agent="unit-test-fingerprint"`) {
+		t.Fatalf("expected user agent in caller fingerprint log, got output %q", output)
+	}
+}
+
+func TestStoreChatPreservesEphemeralSettings(t *testing.T) {
+	ms := newTestMessageStore(t)
+
+	chatJID := "15551234567@s.whatsapp.net"
+	if err := ms.UpdateChatEphemeralSettings(chatJID, 604800, 1710000000); err != nil {
+		t.Fatalf("failed to seed ephemeral settings: %v", err)
+	}
+
+	if err := ms.StoreChat(chatJID, "Alice", time.Unix(1710000100, 0)); err != nil {
+		t.Fatalf("failed to store chat: %v", err)
+	}
+
+	settings, err := ms.GetChatEphemeralSettings(chatJID)
+	if err != nil {
+		t.Fatalf("failed to load ephemeral settings: %v", err)
+	}
+	if settings.Expiration != 604800 {
+		t.Fatalf("expected expiration 604800, got %d", settings.Expiration)
+	}
+	if settings.SettingTimestamp != 1710000000 {
+		t.Fatalf("expected setting timestamp 1710000000, got %d", settings.SettingTimestamp)
+	}
+}
+
+func TestResolveRecipientJIDResolvesPhoneToCachedLID(t *testing.T) {
+	phoneJID := types.JID{User: "15551234567", Server: types.DefaultUserServer}
+	lidJID := types.JID{User: "123456789012345", Server: types.HiddenUserServer}
+	client := newTestClient(&mockLIDStore{
+		lidByPN: map[types.JID]types.JID{phoneJID: lidJID},
+	})
+
+	got, err := resolveRecipientJID(client, phoneJID.User)
+	if err != nil {
+		t.Fatalf("resolveRecipientJID returned error: %v", err)
+	}
+
+	if got != lidJID {
+		t.Fatalf("expected cached LID %s, got %s", lidJID, got)
+	}
+}
+
+// TestUpdateChatEphemeralSettings_IgnoresZeroTimestamp pins down the sparse-chunk
+// guard: a write with settingTimestamp == 0 carries no information about when
+// the user toggled the chat's ephemeral state, so it must not clobber a
+// previously-captured non-zero value. WhatsApp's history sync delivers
+// Conversation records in many chunks; sparse later chunks omit the ephemeral
+// fields and would otherwise reset the row to (0, 0).
+func TestUpdateChatEphemeralSettings_IgnoresZeroTimestamp(t *testing.T) {
+	ms := newTestMessageStore(t)
+
+	chatJID := "15551234567@s.whatsapp.net"
+	if err := ms.UpdateChatEphemeralSettings(chatJID, 604800, 1710000000); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := ms.UpdateChatEphemeralSettings(chatJID, 0, 0); err != nil {
+		t.Fatalf("zero-ts write: %v", err)
+	}
+
+	settings, err := ms.GetChatEphemeralSettings(chatJID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if settings.Expiration != 604800 || settings.SettingTimestamp != 1710000000 {
+		t.Fatalf("expected sparse zero-ts write to be ignored; got (%d, %d)",
+			settings.Expiration, settings.SettingTimestamp)
+	}
+}
+
+// TestUpdateChatEphemeralSettings_IgnoresOlderTimestamp pins down the
+// monotonic-update rule: a write whose settingTimestamp is older than the
+// stored one is stale (out-of-order delivery) and must not overwrite. This
+// lets handleMessage safely write ephemeral-from-ContextInfo on every inbound
+// message without worrying about replays / late history-sync chunks.
+func TestUpdateChatEphemeralSettings_IgnoresOlderTimestamp(t *testing.T) {
+	ms := newTestMessageStore(t)
+
+	chatJID := "15551234567@s.whatsapp.net"
+	if err := ms.UpdateChatEphemeralSettings(chatJID, 604800, 1710000000); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// An older event (ts=1700000000) should not overwrite, even though both
+	// expiration and ts are non-zero.
+	if err := ms.UpdateChatEphemeralSettings(chatJID, 86400, 1700000000); err != nil {
+		t.Fatalf("older-ts write: %v", err)
+	}
+
+	settings, err := ms.GetChatEphemeralSettings(chatJID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if settings.Expiration != 604800 || settings.SettingTimestamp != 1710000000 {
+		t.Fatalf("expected older-ts write to be ignored; got (%d, %d)",
+			settings.Expiration, settings.SettingTimestamp)
+	}
+}
+
+// TestExtractChatEphemeralFromMessage covers every concrete sub-message type
+// that carries ContextInfo. Each regular message in an ephemeral chat stamps
+// ContextInfo.Expiration / EphemeralSettingTimestamp; the bridge backfills
+// from this so it doesn't depend on receiving a live EPHEMERAL_SETTING toggle
+// or a fresh history sync.
+func TestExtractChatEphemeralFromMessage(t *testing.T) {
+	ctx := &waProto.ContextInfo{
+		Expiration:                proto.Uint32(604800),
+		EphemeralSettingTimestamp: proto.Int64(1710000000),
+	}
+
+	cases := []struct {
+		name string
+		msg  *waProto.Message
+		want ChatEphemeralSettings
+	}{
+		{
+			name: "ExtendedTextMessage",
+			msg:  &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{ContextInfo: ctx}},
+			want: ChatEphemeralSettings{Expiration: 604800, SettingTimestamp: 1710000000},
+		},
+		{
+			name: "ImageMessage",
+			msg:  &waProto.Message{ImageMessage: &waProto.ImageMessage{ContextInfo: ctx}},
+			want: ChatEphemeralSettings{Expiration: 604800, SettingTimestamp: 1710000000},
+		},
+		{
+			name: "VideoMessage",
+			msg:  &waProto.Message{VideoMessage: &waProto.VideoMessage{ContextInfo: ctx}},
+			want: ChatEphemeralSettings{Expiration: 604800, SettingTimestamp: 1710000000},
+		},
+		{
+			name: "AudioMessage",
+			msg:  &waProto.Message{AudioMessage: &waProto.AudioMessage{ContextInfo: ctx}},
+			want: ChatEphemeralSettings{Expiration: 604800, SettingTimestamp: 1710000000},
+		},
+		{
+			name: "DocumentMessage",
+			msg:  &waProto.Message{DocumentMessage: &waProto.DocumentMessage{ContextInfo: ctx}},
+			want: ChatEphemeralSettings{Expiration: 604800, SettingTimestamp: 1710000000},
+		},
+		{
+			name: "StickerMessage",
+			msg:  &waProto.Message{StickerMessage: &waProto.StickerMessage{ContextInfo: ctx}},
+			want: ChatEphemeralSettings{Expiration: 604800, SettingTimestamp: 1710000000},
+		},
+		{
+			name: "Conversation (no ContextInfo at all)",
+			msg:  &waProto.Message{Conversation: proto.String("plain text")},
+			want: ChatEphemeralSettings{},
+		},
+		{
+			name: "Nil",
+			msg:  nil,
+			want: ChatEphemeralSettings{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractChatEphemeralFromMessage(tc.msg)
+			if got != tc.want {
+				t.Errorf("extractChatEphemeralFromMessage() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleMessage_BackfillsEphemeralFromContextInfo asserts the end-to-end
+// backfill: an inbound regular message whose ContextInfo carries a
+// non-zero EphemeralSettingTimestamp must update the chat's ephemeral
+// settings row, so subsequent outgoing messages from the bridge respect the
+// chat's disappearing-message timer.
+func TestHandleMessage_BackfillsEphemeralFromContextInfo(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	msg := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     phonePN,
+				Sender:   phonePN,
+				IsFromMe: false,
+			},
+			ID:        "ephemeral-backfill-001",
+			Timestamp: time.Now(),
+		},
+		Message: &waProto.Message{
+			ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text: proto.String("hi from a disappearing chat"),
+				ContextInfo: &waProto.ContextInfo{
+					Expiration:                proto.Uint32(604800),
+					EphemeralSettingTimestamp: proto.Int64(1710000000),
+				},
+			},
+		},
+	}
+
+	handleMessage(client, ms, msg, logger)
+
+	settings, err := ms.GetChatEphemeralSettings(phonePN.String())
+	if err != nil {
+		t.Fatalf("get ephemeral settings: %v", err)
+	}
+	if settings.Expiration != 604800 || settings.SettingTimestamp != 1710000000 {
+		t.Fatalf("expected handleMessage to backfill (604800, 1710000000); got (%d, %d)",
+			settings.Expiration, settings.SettingTimestamp)
+	}
+}
+
+func TestApplyChatEphemeralSettingsConvertsConversation(t *testing.T) {
+	msg := &waProto.Message{
+		Conversation: proto.String("hello"),
+	}
+
+	applyChatEphemeralSettings(msg, ChatEphemeralSettings{
+		Expiration:       604800,
+		SettingTimestamp: 1710000000,
+	})
+
+	if msg.Conversation != nil {
+		t.Fatalf("expected conversation to be converted to extended text")
+	}
+	if msg.GetExtendedTextMessage() == nil {
+		t.Fatalf("expected extended text message to be set")
+	}
+	if got := msg.GetExtendedTextMessage().GetText(); got != "hello" {
+		t.Fatalf("expected text hello, got %q", got)
+	}
+	if got := msg.GetExtendedTextMessage().GetContextInfo().GetExpiration(); got != 604800 {
+		t.Fatalf("expected expiration 604800, got %d", got)
+	}
+	if got := msg.GetExtendedTextMessage().GetContextInfo().GetEphemeralSettingTimestamp(); got != 1710000000 {
+		t.Fatalf("expected setting timestamp 1710000000, got %d", got)
+	}
+	if got := msg.GetExtendedTextMessage().GetContextInfo().GetDisappearingMode().GetTrigger(); got != waProto.DisappearingMode_CHAT_SETTING {
+		t.Fatalf("expected disappearing mode trigger CHAT_SETTING, got %v", got)
+	}
 }
 
 func testLogger() waLog.Logger {
@@ -167,6 +535,63 @@ var (
 	phoneLID = types.JID{User: "185366493536339", Server: types.HiddenUserServer}
 	phonePN  = types.JID{User: "11234567890", Server: types.DefaultUserServer}
 )
+
+func TestGetChatName_LocalContactFallbackScopesToActiveAccount(t *testing.T) {
+	activeSelf := types.JID{User: "15550000001", Server: types.DefaultUserServer}
+	otherSelf := types.JID{User: "15550000002", Server: types.DefaultUserServer}
+
+	client := newTestClientWithSelf(&mockLIDStore{}, activeSelf)
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	waDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open whatsmeow db: %v", err)
+	}
+	t.Cleanup(func() { _ = waDB.Close() })
+	ms.waDB = waDB
+
+	if _, err := waDB.Exec(`
+		CREATE TABLE whatsmeow_contacts (
+			our_jid TEXT,
+			their_jid TEXT,
+			first_name TEXT,
+			full_name TEXT,
+			push_name TEXT,
+			business_name TEXT,
+			PRIMARY KEY (our_jid, their_jid)
+		);
+		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name, push_name, business_name)
+			VALUES (?, ?, 'Wrong', 'Wrong Account', '', '');
+		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name, push_name, business_name)
+			VALUES (?, ?, 'Active First', '', 'Active Push', 'Active Business');
+	`, otherSelf.String(), phonePN.String(), activeSelf.String(), phonePN.String()); err != nil {
+		t.Fatalf("seed whatsmeow contacts: %v", err)
+	}
+
+	got := GetChatName(client, ms, phonePN, phonePN.String(), nil, "Sender Fallback", logger)
+	if got != "Active Push" {
+		t.Fatalf("GetChatName() = %q, want active account contact name", got)
+	}
+}
+
+func TestGetChatName_LocalContactFallbackMissingTableFallsBack(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	waDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open whatsmeow db: %v", err)
+	}
+	t.Cleanup(func() { _ = waDB.Close() })
+	ms.waDB = waDB
+
+	got := GetChatName(client, ms, phonePN, phonePN.String(), nil, "Sender Fallback", logger)
+	if got != "Sender Fallback" {
+		t.Fatalf("GetChatName() = %q, want sender fallback", got)
+	}
+}
 
 // --- Integration tests: handleMessage stores under correct JID ---
 
@@ -715,6 +1140,69 @@ func TestExtractTextContent_SurfacesMediaCaptions(t *testing.T) {
 			want: "invoice attached",
 		},
 		{
+			name: "TemplateMessage with hydrated content text",
+			msg: &waProto.Message{
+				TemplateMessage: &waProto.TemplateMessage{
+					HydratedTemplate: &waProto.TemplateMessage_HydratedFourRowTemplate{
+						HydratedContentText: proto.String("template body"),
+					},
+				},
+			},
+			want: "template body",
+		},
+		{
+			name: "ButtonsMessage with content text",
+			msg: &waProto.Message{
+				ButtonsMessage: &waProto.ButtonsMessage{ContentText: proto.String("buttons body")},
+			},
+			want: "buttons body",
+		},
+		{
+			name: "ButtonsMessage with header text",
+			msg: &waProto.Message{
+				ButtonsMessage: &waProto.ButtonsMessage{
+					Header: &waProto.ButtonsMessage_Text{Text: "buttons fallback"},
+				},
+			},
+			want: "buttons fallback",
+		},
+		{
+			name: "InteractiveMessage with body text",
+			msg: &waProto.Message{
+				InteractiveMessage: &waProto.InteractiveMessage{
+					Body: &waProto.InteractiveMessage_Body{Text: proto.String("interactive body")},
+				},
+			},
+			want: "interactive body",
+		},
+		{
+			name: "ListMessage with description",
+			msg: &waProto.Message{
+				ListMessage: &waProto.ListMessage{Description: proto.String("choose an option")},
+			},
+			want: "choose an option",
+		},
+		{
+			name: "ButtonsResponseMessage with selected display text",
+			msg: &waProto.Message{
+				ButtonsResponseMessage: &waProto.ButtonsResponseMessage{
+					Response: &waProto.ButtonsResponseMessage_SelectedDisplayText{
+						SelectedDisplayText: "selected display",
+					},
+				},
+			},
+			want: "selected display",
+		},
+		{
+			name: "TemplateButtonReplyMessage with selected display text",
+			msg: &waProto.Message{
+				TemplateButtonReplyMessage: &waProto.TemplateButtonReplyMessage{
+					SelectedDisplayText: proto.String("template selection"),
+				},
+			},
+			want: "template selection",
+		},
+		{
 			name: "ImageMessage without caption returns empty",
 			msg:  &waProto.Message{ImageMessage: &waProto.ImageMessage{}},
 			want: "",
@@ -733,6 +1221,61 @@ func TestExtractTextContent_SurfacesMediaCaptions(t *testing.T) {
 				t.Errorf("extractTextContent() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestExtractMediaInfo_Sticker(t *testing.T) {
+	ts := time.Unix(1710000000, 0).UTC()
+	msgID := "TEST_STICKER_ID"
+
+	url := "https://mmg.whatsapp.net/v/t62.7161-24/sticker.enc"
+	mediaKey := []byte{0x01, 0x02, 0x03}
+	sha := []byte{0xaa, 0xbb}
+	encSha := []byte{0xcc, 0xdd}
+	var length uint64 = 660
+
+	msg := &waProto.Message{
+		StickerMessage: &waProto.StickerMessage{
+			URL:           proto.String(url),
+			MediaKey:      mediaKey,
+			FileSHA256:    sha,
+			FileEncSHA256: encSha,
+			FileLength:    proto.Uint64(length),
+		},
+	}
+
+	gotType, gotFile, gotURL, gotKey, gotSHA, gotEncSHA, gotLen := extractMediaInfo(msg, ts, msgID)
+
+	if gotType != "sticker" {
+		t.Errorf("mediaType = %q, want %q", gotType, "sticker")
+	}
+	wantFile := "sticker_" + ts.Format("20060102_150405") + "_" + msgID + ".webp"
+	if gotFile != wantFile {
+		t.Errorf("filename = %q, want %q", gotFile, wantFile)
+	}
+	if gotURL != url {
+		t.Errorf("url = %q, want %q", gotURL, url)
+	}
+	if string(gotKey) != string(mediaKey) {
+		t.Errorf("mediaKey = %x, want %x", gotKey, mediaKey)
+	}
+	if string(gotSHA) != string(sha) {
+		t.Errorf("fileSHA256 = %x, want %x", gotSHA, sha)
+	}
+	if string(gotEncSHA) != string(encSha) {
+		t.Errorf("fileEncSHA256 = %x, want %x", gotEncSHA, encSha)
+	}
+	if gotLen != length {
+		t.Errorf("fileLength = %d, want %d", gotLen, length)
+	}
+}
+
+func TestExtractMediaInfo_NoMediaReturnsEmpty(t *testing.T) {
+	msg := &waProto.Message{Conversation: proto.String("plain text, not media")}
+	gotType, gotFile, gotURL, gotKey, _, _, gotLen := extractMediaInfo(msg, time.Unix(1710000000, 0), "X")
+	if gotType != "" || gotFile != "" || gotURL != "" || gotKey != nil || gotLen != 0 {
+		t.Errorf("non-media should return empty: type=%q file=%q url=%q keyLen=%d len=%d",
+			gotType, gotFile, gotURL, len(gotKey), gotLen)
 	}
 }
 
@@ -839,6 +1382,26 @@ func captureWebhook(t *testing.T) (*httptest.Server, <-chan WebhookPayload) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var p WebhookPayload
+		if err := json.Unmarshal(body, &p); err == nil {
+			select {
+			case ch <- p:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, ch
+}
+
+// captureRawWebhook starts a local httptest server that records the first raw
+// JSON webhook payload it receives.
+func captureRawWebhook(t *testing.T) (*httptest.Server, <-chan map[string]any) {
+	t.Helper()
+	ch := make(chan map[string]any, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var p map[string]any
 		if err := json.Unmarshal(body, &p); err == nil {
 			select {
 			case ch <- p:
@@ -1137,5 +1700,865 @@ func TestCallChatJID_Precedence(t *testing.T) {
 				t.Errorf("callChatJID() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// revokeEvent builds an inbound events.Message carrying a
+// ProtocolMessage_REVOKE that targets the given message ID. Tests use
+// this to drive handleMessage end-to-end rather than reaching into
+// internal helpers.
+func revokeEvent(targetID string, ts time.Time) *events.Message {
+	revokeType := waProto.ProtocolMessage_REVOKE
+	return &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     phonePN,
+				Sender:   phonePN,
+				IsFromMe: false,
+			},
+			ID:        "carrier-" + targetID,
+			Timestamp: ts,
+		},
+		Message: &waProto.Message{
+			ProtocolMessage: &waProto.ProtocolMessage{
+				Type: &revokeType,
+				Key: &waCommon.MessageKey{
+					RemoteJID: proto.String(phonePN.String()),
+					ID:        proto.String(targetID),
+					FromMe:    proto.Bool(false),
+				},
+			},
+		},
+	}
+}
+
+// readDeletedAt returns the deleted_at value for a message row, with
+// ok=false if the row doesn't exist or the column is NULL.
+func readDeletedAt(t *testing.T, ms *MessageStore, chatJID, messageID string) (time.Time, bool) {
+	t.Helper()
+	var got sql.NullTime
+	if err := ms.db.QueryRow(
+		"SELECT deleted_at FROM messages WHERE id = ? AND chat_jid = ?",
+		messageID, chatJID,
+	).Scan(&got); err != nil {
+		if err == sql.ErrNoRows {
+			return time.Time{}, false
+		}
+		t.Fatalf("read deleted_at: %v", err)
+	}
+	return got.Time, got.Valid
+}
+
+func TestHandleMessage_RevokeMarksTargetDeleted(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	chatJID := phonePN.String()
+	targetID := "3A1234567890ABCDEF"
+
+	if _, err := ms.db.Exec(
+		`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		targetID, chatJID, phonePN.User, "secret", time.Unix(1710000000, 0), false,
+	); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	revokedAt := time.Unix(1710000010, 0)
+	handleMessage(client, ms, revokeEvent(targetID, revokedAt), testLogger())
+
+	got, valid := readDeletedAt(t, ms, chatJID, targetID)
+	if !valid {
+		t.Fatalf("expected REVOKE to mark target row as deleted")
+	}
+	if !got.Equal(revokedAt) {
+		t.Fatalf("expected deleted_at=%v, got %v", revokedAt, got)
+	}
+
+	var content string
+	if err := ms.db.QueryRow("SELECT content FROM messages WHERE id = ? AND chat_jid = ?",
+		targetID, chatJID).Scan(&content); err != nil {
+		t.Fatalf("read content: %v", err)
+	}
+	if content != "secret" {
+		t.Fatalf("content must be preserved on revoke, got %q", content)
+	}
+}
+
+func TestHandleMessage_RevokeIsNoopForUnknownTarget(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+
+	// No seeded row — bridge was offline when the original arrived, or it
+	// was deleted before this code path shipped. The handler must not
+	// error and must not invent a row.
+	handleMessage(client, ms, revokeEvent("NEVER_SEEN", time.Unix(1710000010, 0)), testLogger())
+
+	var rowCount int
+	if err := ms.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&rowCount); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	if rowCount != 0 {
+		t.Fatalf("expected no rows in messages, got %d", rowCount)
+	}
+}
+
+func TestHandleMessage_DuplicateRevokeKeepsEarliestDeletedAt(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	chatJID := phonePN.String()
+	targetID := "3A1234567890ABCDEF"
+
+	if _, err := ms.db.Exec(
+		`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		targetID, chatJID, phonePN.User, "x", time.Unix(1710000000, 0), false,
+	); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	earlier := time.Unix(1710000010, 0)
+	later := time.Unix(1710000020, 0)
+
+	handleMessage(client, ms, revokeEvent(targetID, earlier), testLogger())
+	handleMessage(client, ms, revokeEvent(targetID, later), testLogger())
+
+	got, valid := readDeletedAt(t, ms, chatJID, targetID)
+	if !valid || !got.Equal(earlier) {
+		t.Fatalf("expected earlier deleted_at=%v to be preserved across a duplicate revoke, got %v", earlier, got)
+	}
+}
+
+func TestHandleMessage_ReplayedOriginalPreservesDeletedAt(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	chatJID := phonePN.String()
+	targetID := "3A1234567890ABCDEF"
+
+	if _, err := ms.db.Exec(
+		`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		targetID, chatJID, phonePN.User, "secret", time.Unix(1710000000, 0), false,
+	); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	revokedAt := time.Unix(1710000010, 0)
+	handleMessage(client, ms, revokeEvent(targetID, revokedAt), testLogger())
+
+	replayedOriginal := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: phonePN, Sender: phonePN, IsFromMe: false},
+			ID:            targetID,
+			Timestamp:     time.Unix(1710000020, 0),
+		},
+		Message: &waProto.Message{Conversation: proto.String("replayed original")},
+	}
+	handleMessage(client, ms, replayedOriginal, testLogger())
+
+	got, valid := readDeletedAt(t, ms, chatJID, targetID)
+	if !valid || !got.Equal(revokedAt) {
+		t.Fatalf("expected replayed original to preserve deleted_at=%v, got %v (valid=%v)", revokedAt, got, valid)
+	}
+}
+
+// --- Reaction tests ---
+
+// queryMessageMediaTypeAndFilename returns the (media_type, filename) for a
+// stored message, or empty strings if not found.
+func queryMessageMediaTypeAndFilename(ms *MessageStore, chatJID, msgID string) (mediaType, filename string, found bool) {
+	err := ms.db.QueryRow(
+		"SELECT COALESCE(media_type,''), COALESCE(filename,'') FROM messages WHERE id = ? AND chat_jid = ?",
+		msgID, chatJID,
+	).Scan(&mediaType, &filename)
+	return mediaType, filename, err == nil
+}
+
+// buildReactionMessage constructs an events.Message carrying a ReactionMessage
+// targeting the given message ID with the given emoji.
+func buildReactionMessage(chat, sender types.JID, isFromMe bool, reactedToID, emoji string) *events.Message {
+	return &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chat,
+				Sender:   sender,
+				IsFromMe: isFromMe,
+			},
+			ID:        "react-" + reactedToID,
+			Timestamp: time.Now(),
+		},
+		Message: &waProto.Message{
+			ReactionMessage: &waProto.ReactionMessage{
+				Key: &waCommon.MessageKey{
+					RemoteJID: proto.String(chat.String()),
+					ID:        proto.String(reactedToID),
+					FromMe:    proto.Bool(false),
+				},
+				Text: proto.String(emoji),
+			},
+		},
+	}
+}
+
+// TestHandleMessage_InboundReaction_Stored verifies that an inbound reaction is
+// stored as media_type="reaction" with the emoji in content and the
+// reacted-to message ID in the filename column.
+func TestHandleMessage_InboundReaction_Stored(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	chatJID := phonePN.String()
+	targetID := "3AABCDEF01234567"
+	emoji := "👍"
+
+	msg := buildReactionMessage(phonePN, phonePN, false, targetID, emoji)
+	handleMessage(client, ms, msg, logger)
+
+	mediaType, filename, found := queryMessageMediaTypeAndFilename(ms, chatJID, msg.Info.ID)
+	if !found {
+		t.Fatalf("expected reaction to be stored, but message row not found")
+	}
+	if mediaType != "reaction" {
+		t.Errorf("media_type = %q, want %q", mediaType, "reaction")
+	}
+	if filename != targetID {
+		t.Errorf("filename (reacted-to ID) = %q, want %q", filename, targetID)
+	}
+
+	// Verify the emoji is stored in the content column.
+	var content string
+	if err := ms.db.QueryRow(
+		"SELECT content FROM messages WHERE id = ? AND chat_jid = ?",
+		msg.Info.ID, chatJID,
+	).Scan(&content); err != nil {
+		t.Fatalf("read content: %v", err)
+	}
+	if content != emoji {
+		t.Errorf("content = %q, want emoji %q", content, emoji)
+	}
+}
+
+// TestHandleMessage_EmptyEmojiReaction_Stored verifies that a reaction with an
+// empty emoji (reaction removal) is stored rather than silently dropped.
+// Consumers can detect removal by checking content == "".
+func TestHandleMessage_EmptyEmojiReaction_Stored(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	chatJID := phonePN.String()
+	targetID := "3AABCDEF01234568"
+
+	msg := buildReactionMessage(phonePN, phonePN, false, targetID, "" /* empty = removal */)
+	handleMessage(client, ms, msg, logger)
+
+	mediaType, filename, found := queryMessageMediaTypeAndFilename(ms, chatJID, msg.Info.ID)
+	if !found {
+		t.Fatalf("empty-emoji reaction (removal) must be stored, but message row not found")
+	}
+	if mediaType != "reaction" {
+		t.Errorf("media_type = %q, want %q", mediaType, "reaction")
+	}
+	if filename != targetID {
+		t.Errorf("filename = %q, want %q", filename, targetID)
+	}
+}
+
+// TestHandleMessage_InboundReaction_WebhookForwarded verifies that inbound
+// reactions are forwarded as typed webhook events after being stored.
+func TestHandleMessage_InboundReaction_WebhookForwarded(t *testing.T) {
+	srv, webhookCh := captureRawWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	chatJID := phonePN.String()
+	targetID := "3AABCDEF01234569"
+	emoji := "👍"
+
+	msg := buildReactionMessage(phonePN, phonePN, false, targetID, emoji)
+	handleMessage(client, ms, msg, logger)
+
+	mediaType, filename, found := queryMessageMediaTypeAndFilename(ms, chatJID, msg.Info.ID)
+	if !found {
+		t.Fatalf("expected reaction to be stored, but message row not found")
+	}
+	if mediaType != "reaction" {
+		t.Errorf("media_type = %q, want %q", mediaType, "reaction")
+	}
+	if filename != targetID {
+		t.Errorf("filename = %q, want %q", filename, targetID)
+	}
+
+	select {
+	case payload := <-webhookCh:
+		if payload["eventType"] != "reaction" {
+			t.Errorf("eventType = %v, want reaction", payload["eventType"])
+		}
+		if payload["mediaType"] != "reaction" {
+			t.Errorf("mediaType = %v, want reaction", payload["mediaType"])
+		}
+		if payload["messageId"] != msg.Info.ID {
+			t.Errorf("messageId = %v, want %s", payload["messageId"], msg.Info.ID)
+		}
+		if payload["reactionToMessageId"] != targetID {
+			t.Errorf("reactionToMessageId = %v, want %s", payload["reactionToMessageId"], targetID)
+		}
+		if payload["reactionEmoji"] != emoji {
+			t.Errorf("reactionEmoji = %v, want %s", payload["reactionEmoji"], emoji)
+		}
+		if payload["reactionRemoved"] != false {
+			t.Errorf("reactionRemoved = %v, want false", payload["reactionRemoved"])
+		}
+		if payload["content"] != emoji {
+			t.Errorf("content = %v, want %s", payload["content"], emoji)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for reaction webhook call")
+	}
+}
+
+// TestHandleMessage_EmptyEmojiReaction_WebhookForwarded verifies that reaction
+// removals are forwarded even though their content is the empty string.
+func TestHandleMessage_EmptyEmojiReaction_WebhookForwarded(t *testing.T) {
+	srv, webhookCh := captureRawWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	targetID := "3AABCDEF01234570"
+
+	msg := buildReactionMessage(phonePN, phonePN, false, targetID, "")
+	handleMessage(client, ms, msg, logger)
+
+	select {
+	case payload := <-webhookCh:
+		if payload["eventType"] != "reaction" {
+			t.Errorf("eventType = %v, want reaction", payload["eventType"])
+		}
+		if payload["content"] != "" {
+			t.Errorf("content = %v, want empty string", payload["content"])
+		}
+		if payload["reactionEmoji"] != "" {
+			t.Errorf("reactionEmoji = %v, want empty string", payload["reactionEmoji"])
+		}
+		if payload["reactionRemoved"] != true {
+			t.Errorf("reactionRemoved = %v, want true", payload["reactionRemoved"])
+		}
+		if payload["reactionToMessageId"] != targetID {
+			t.Errorf("reactionToMessageId = %v, want %s", payload["reactionToMessageId"], targetID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for reaction removal webhook call")
+	}
+}
+
+// TestHandleMessage_SelfReactionWebhook_RespectsForwardSelf verifies that
+// self-authored reactions use the same FORWARD_SELF behavior as normal messages.
+func TestHandleMessage_SelfReactionWebhook_RespectsForwardSelf(t *testing.T) {
+	srv, webhookCh := captureRawWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	previous := forwardSelfMessages
+	forwardSelfMessages = false
+	t.Cleanup(func() {
+		forwardSelfMessages = previous
+	})
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	msg := buildReactionMessage(phonePN, phonePN, true, "3AABCDEF01234571", "👍")
+	handleMessage(client, ms, msg, logger)
+
+	if count := queryMessageCount(ms, phonePN.String()); count != 1 {
+		t.Errorf("expected self reaction to be stored, got %d stored messages", count)
+	}
+
+	select {
+	case payload := <-webhookCh:
+		t.Fatalf("unexpected webhook for self reaction when FORWARD_SELF=false: %#v", payload)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestHandleMessage_ReactionWithoutKey_NotStored verifies that a reaction
+// with no key (no reacted-to message ID) is silently ignored and not stored.
+func TestHandleMessage_ReactionWithoutKey_NotStored(t *testing.T) {
+	srv, webhookCh := captureRawWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	msg := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     phonePN,
+				Sender:   phonePN,
+				IsFromMe: false,
+			},
+			ID:        "react-no-key",
+			Timestamp: time.Now(),
+		},
+		Message: &waProto.Message{
+			ReactionMessage: &waProto.ReactionMessage{
+				Key:  nil, // no key — no reacted-to ID
+				Text: proto.String("👍"),
+			},
+		},
+	}
+	handleMessage(client, ms, msg, logger)
+
+	if count := queryMessageCount(ms, phonePN.String()); count != 0 {
+		t.Errorf("expected reaction without key to be discarded, got %d stored messages", count)
+	}
+
+	select {
+	case payload := <-webhookCh:
+		t.Fatalf("unexpected webhook for reaction without key: %#v", payload)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestReactHandler_MissingFields_Returns400 verifies that the /api/react
+// handler returns 400 when recipient or message_id is absent.
+func TestReactHandler_MissingFields_Returns400(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty body", "{}"},
+		{"missing message_id", `{"recipient":"15551234567@s.whatsapp.net"}`},
+		{"missing recipient", `{"message_id":"3AABCDEF01234567","emoji":"👍"}`},
+		{"missing emoji", `{"recipient":"15551234567@s.whatsapp.net","message_id":"3AABCDEF01234567"}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/react", strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			resp := httptest.NewRecorder()
+			handler.ServeHTTP(resp, req)
+			if resp.Code != http.StatusBadRequest {
+				t.Errorf("body=%q: expected 400, got %d", tc.body, resp.Code)
+			}
+		})
+	}
+}
+
+func TestReactHandler_GroupReactionMissingSenderJID_Returns400(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	body := `{"recipient":"120363012345678901@g.us","message_id":"3AABCDEF01234567","emoji":"👍","from_me":false}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/react", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing sender_jid on group reaction, got %d", resp.Code)
+	}
+}
+
+func TestReactHandler_GroupReactionInvalidSenderJID_Returns400(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	body := `{"recipient":"120363012345678901@g.us","message_id":"3AABCDEF01234567","emoji":"👍","from_me":false,"sender_jid":"@s.whatsapp.net"}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/react", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid sender_jid on group reaction, got %d", resp.Code)
+	}
+}
+
+// TestReactHandler_NoAuth_Returns401 verifies that the /api/react handler
+// rejects requests that do not carry a valid bearer token.
+func TestReactHandler_NoAuth_Returns401(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/react",
+		strings.NewReader(`{"recipient":"15551234567@s.whatsapp.net","message_id":"3AABCDEF01234567","emoji":"👍"}`))
+	req.Header.Set("Content-Type", "application/json")
+	// Deliberately omit Authorization header.
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without auth, got %d", resp.Code)
+	}
+}
+
+func TestHandleMessage_RegularMessageDoesNotMarkDeleted(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	chatJID := phonePN.String()
+	seededID := "PRE_EXISTING_MESSAGE"
+
+	if _, err := ms.db.Exec(
+		`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		seededID, chatJID, phonePN.User, "still here", time.Unix(1710000000, 0), false,
+	); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// A regular text message arriving in the same chat must not touch
+	// deleted_at on any existing row, and must not mark itself deleted.
+	regular := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: phonePN, Sender: phonePN, IsFromMe: false},
+			ID:            "REGULAR_MSG",
+			Timestamp:     time.Unix(1710000010, 0),
+		},
+		Message: &waProto.Message{Conversation: proto.String("just a normal hello")},
+	}
+	handleMessage(client, ms, regular, testLogger())
+
+	if _, valid := readDeletedAt(t, ms, chatJID, seededID); valid {
+		t.Fatalf("regular message must not flip deleted_at on the pre-existing row")
+	}
+	if _, valid := readDeletedAt(t, ms, chatJID, "REGULAR_MSG"); valid {
+		t.Fatalf("regular message must not flip its own deleted_at")
+	}
+}
+
+// --- Quoted-reply tests ---
+
+// queryQuotedMessageID returns the quoted_message_id column for a stored
+// message row, or (empty, false) if the row does not exist.
+func queryQuotedMessageID(ms *MessageStore, chatJID, msgID string) (string, bool) {
+	var val sql.NullString
+	err := ms.db.QueryRow(
+		"SELECT quoted_message_id FROM messages WHERE id = ? AND chat_jid = ?",
+		msgID, chatJID,
+	).Scan(&val)
+	if err != nil {
+		return "", false
+	}
+	return val.String, val.Valid
+}
+
+// TestHandleMessage_QuotedReply_IDPersisted verifies that an inbound
+// ExtendedTextMessage reply that carries a ContextInfo.StanzaID has its
+// quoted_message_id column populated correctly.
+func TestHandleMessage_QuotedReply_IDPersisted(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	chatJID := phonePN.String()
+	targetID := "3AORIGINAL1234567"
+	replyID := "3AREPLY0000000001"
+
+	msg := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     phonePN,
+				Sender:   phonePN,
+				IsFromMe: false,
+			},
+			ID:        replyID,
+			Timestamp: time.Now(),
+		},
+		Message: &waProto.Message{
+			ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text: proto.String("Great point!"),
+				ContextInfo: &waProto.ContextInfo{
+					StanzaID:      proto.String(targetID),
+					Participant:   proto.String(phonePN.String()),
+					QuotedMessage: &waProto.Message{Conversation: proto.String("original text")},
+				},
+			},
+		},
+	}
+
+	handleMessage(client, ms, msg, logger)
+
+	quotedID, valid := queryQuotedMessageID(ms, chatJID, replyID)
+	if !valid {
+		t.Fatalf("expected quoted_message_id to be set, got NULL")
+	}
+	if quotedID != targetID {
+		t.Errorf("quoted_message_id = %q, want %q", quotedID, targetID)
+	}
+}
+
+// TestHandleMessage_PlainMessage_QuotedIDIsNull verifies that a plain
+// Conversation message (no ContextInfo) has a NULL quoted_message_id.
+func TestHandleMessage_PlainMessage_QuotedIDIsNull(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	chatJID := phonePN.String()
+	msgID := "3APLAIN0000000001"
+
+	msg := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     phonePN,
+				Sender:   phonePN,
+				IsFromMe: false,
+			},
+			ID:        msgID,
+			Timestamp: time.Now(),
+		},
+		Message: &waProto.Message{
+			Conversation: proto.String("just a plain message"),
+		},
+	}
+
+	handleMessage(client, ms, msg, logger)
+
+	_, valid := queryQuotedMessageID(ms, chatJID, msgID)
+	if valid {
+		t.Fatalf("plain message must have NULL quoted_message_id")
+	}
+}
+
+// TestSendHandler_MissingRecipient_Returns400 covers the /api/send validation
+// path when recipient is empty — complements the quoted-reply handler path.
+func TestSendHandler_QuotedReplyFields_PassedThrough(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	// POST with quoted_message_id but no recipient — should 400 before
+	// any send attempt, proving the new fields are parsed.
+	body := `{"recipient":"","message":"hi","quoted_message_id":"3AORIGINAL","quoted_sender_jid":"1234@s.whatsapp.net","quoted_content":"original"}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/send", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	// Empty recipient → 400
+	if resp.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty recipient with quoted fields, got %d", resp.Code)
+	}
+}
+
+// TestExtractQuotedMessageInfo_ExtendedText verifies the helper that the
+// bridge uses to parse quoted-reply ContextInfo from inbound messages.
+func TestExtractQuotedMessageInfo_ExtendedText(t *testing.T) {
+	stanzaID := "3ATARGET0000001"
+	participant := "15551234567@s.whatsapp.net"
+	quotedText := "the original message"
+
+	msg := &waProto.Message{
+		ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text: proto.String("my reply"),
+			ContextInfo: &waProto.ContextInfo{
+				StanzaID:      proto.String(stanzaID),
+				Participant:   proto.String(participant),
+				QuotedMessage: &waProto.Message{Conversation: proto.String(quotedText)},
+			},
+		},
+	}
+
+	gotID, gotSender, gotContent := extractQuotedMessageInfo(msg)
+	if gotID != stanzaID {
+		t.Errorf("stanzaID = %q, want %q", gotID, stanzaID)
+	}
+	if gotSender != participant {
+		t.Errorf("participant = %q, want %q", gotSender, participant)
+	}
+	if gotContent != quotedText {
+		t.Errorf("content = %q, want %q", gotContent, quotedText)
+	}
+}
+
+func TestExtractMentionedJIDs_ExtendedText(t *testing.T) {
+	msg := &waProto.Message{
+		ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			ContextInfo: &waProto.ContextInfo{
+				MentionedJID: []string{"491742555497@s.whatsapp.net"},
+			},
+		},
+	}
+
+	got := extractMentionedJIDs(msg)
+	if len(got) != 1 || got[0] != "491742555497@s.whatsapp.net" {
+		t.Errorf("mentioned JIDs = %#v", got)
+	}
+}
+
+func TestGetMessageIsFromMe(t *testing.T) {
+	store := newTestMessageStore(t)
+	chatJID := "15551234567@s.whatsapp.net"
+	if err := store.StoreMessage("outbound", chatJID, "15550000000", "[🤖] response", time.Now(), true, "", "", "", nil, nil, nil, 0, ""); err != nil {
+		t.Fatalf("store outbound message: %v", err)
+	}
+
+	isFromMe, err := store.GetMessageIsFromMe("outbound", chatJID)
+	if err != nil || isFromMe == nil || !*isFromMe {
+		t.Fatalf("GetMessageIsFromMe() = %v, %v; want true, nil", isFromMe, err)
+	}
+
+	missing, err := store.GetMessageIsFromMe("missing", chatJID)
+	if err != nil || missing != nil {
+		t.Fatalf("missing lookup = %v, %v; want nil, nil", missing, err)
+	}
+}
+
+// TestExtractQuotedMessageInfo_NoContextInfo verifies graceful handling when
+// the message has no ContextInfo (plain Conversation, ReactionMessage, etc.).
+func TestExtractQuotedMessageInfo_NoContextInfo(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  *waProto.Message
+	}{
+		{"plain conversation", &waProto.Message{Conversation: proto.String("hello")}},
+		{"nil message", nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, sender, content := extractQuotedMessageInfo(tc.msg)
+			if id != "" || sender != "" || content != "" {
+				t.Errorf("expected all empty, got (%q, %q, %q)", id, sender, content)
+			}
+		})
+	}
+}
+
+func TestNewMessageStoreCreatesMessagesChatJIDIndex(t *testing.T) {
+	// NewMessageStore writes to a relative "store/" directory, so run in a
+	// temporary working directory that is cleaned up automatically.
+	t.Chdir(t.TempDir())
+
+	ms, err := NewMessageStore()
+	if err != nil {
+		t.Fatalf("NewMessageStore() failed: %v", err)
+	}
+	defer func() { _ = ms.Close() }()
+
+	var count int
+	if err := ms.db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_messages_chat_jid';`,
+	).Scan(&count); err != nil {
+		t.Fatalf("failed to query index metadata: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected idx_messages_chat_jid to exist, found %d", count)
+	}
+}
+
+func TestResolveDeviceName(t *testing.T) {
+	cases := []struct {
+		name string
+		set  bool
+		env  string
+		want string
+	}{
+		{name: "unset keeps default", set: false, want: ""},
+		{name: "empty keeps default", set: true, env: "", want: ""},
+		{name: "whitespace only keeps default", set: true, env: "   ", want: ""},
+		{name: "plain value", set: true, env: "Agent Works", want: "Agent Works"},
+		{name: "surrounding whitespace trimmed", set: true, env: "  My Assistant  ", want: "My Assistant"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv("WHATSAPP_DEVICE_NAME", tc.env)
+			} else {
+				// t.Setenv restores on cleanup; unset explicitly for this case.
+				_ = os.Unsetenv("WHATSAPP_DEVICE_NAME")
+			}
+			if got := resolveDeviceName(); got != tc.want {
+				t.Fatalf("resolveDeviceName() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveMentionJIDs verifies mapping of mention entries to the JID
+// strings placed in ContextInfo.MentionedJID, including the dual phone+LID
+// form for LID-addressed groups.
+func TestResolveMentionJIDs(t *testing.T) {
+	phonePN := types.JID{User: "12025551234", Server: types.DefaultUserServer}
+	phoneLID := types.JID{User: "111222333444555", Server: types.HiddenUserServer}
+	lidStore := &mockLIDStore{lidByPN: map[types.JID]types.JID{phonePN: phoneLID}}
+	client := newTestClient(lidStore)
+
+	cases := []struct {
+		name     string
+		mentions []string
+		want     []string
+	}{
+		{
+			"phone number with LID mapping yields both forms",
+			[]string{"12025551234"},
+			[]string{phonePN.String(), phoneLID.String()},
+		},
+		{
+			"phone number without LID mapping yields phone JID only",
+			[]string{"19998887777"},
+			[]string{"19998887777@" + types.DefaultUserServer},
+		},
+		{
+			"explicit LID JID passed through unchanged",
+			[]string{phoneLID.String()},
+			[]string{phoneLID.String()},
+		},
+		{
+			"unparseable entry skipped",
+			[]string{"1.2.3@s.whatsapp.net", "12025551234"},
+			[]string{phonePN.String(), phoneLID.String()},
+		},
+		{
+			"empty input yields nil",
+			nil,
+			nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveMentionJIDs(client, tc.mentions)
+			if len(got) != len(tc.want) {
+				t.Fatalf("resolveMentionJIDs(%v) = %v, want %v", tc.mentions, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("resolveMentionJIDs(%v)[%d] = %q, want %q", tc.mentions, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestSendHandler_MentionsField_PassedThrough proves the mentions JSON field
+// is parsed by /api/send — mirrors the quoted-reply field test above.
+func TestSendHandler_MentionsField_PassedThrough(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	// POST with mentions but no recipient — should 400 before any send
+	// attempt, proving the new field parses without error.
+	body := `{"recipient":"","message":"hi @12025551234","mentions":["12025551234"]}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/send", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty recipient with mentions field, got %d", resp.Code)
 	}
 }
