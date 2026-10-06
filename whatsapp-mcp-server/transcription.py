@@ -23,6 +23,8 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from image_description import within_max_age
+
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 DEFAULT_MESSAGES_DB = REPO_ROOT / "whatsapp-bridge" / "store" / "messages.db"
@@ -357,7 +359,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     for message_id, chat_jid, timestamp, sender in targets:
         short_id = message_id[:12]
         audio = find_audio_file(chat_jid, timestamp, message_id)
-        if not audio and args.download:
+        if not audio and args.download and within_max_age(timestamp, args.max_age_days):
             print(f"[dl]   {short_id} fetching from bridge...")
             audio = download_via_bridge(message_id, chat_jid)
         if not audio:
@@ -473,6 +475,12 @@ def build_parser() -> argparse.ArgumentParser:
     bf.add_argument("--limit", type=int, default=None, help="Max messages to transcribe")
     bf.add_argument("--dry-run", action="store_true", help="Only list what would be transcribed")
     bf.add_argument("--download", action="store_true", help="Fetch missing audio from the Go bridge")
+    bf.add_argument(
+        "--max-age-days",
+        type=int,
+        default=None,
+        help="With --download, only fetch media newer than N days (older CDN URLs have expired)",
+    )
     bf.set_defaults(func=cmd_backfill)
 
     s = sub.add_parser("search", help="Search text messages and audio transcripts")
