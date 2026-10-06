@@ -55,9 +55,22 @@ def _bridge_headers() -> dict[str, str]:
 # resulting 32px stride crashes the model runner. Verified: 28px fails, 32px works.
 MIN_MODEL_DIMENSION = 32
 
+# Large photos overflow the model's 4096-token context (a 4080x2296 photo came to
+# 4125 tokens with the prompt, an HTTP 400). Images with a longer side above this
+# are scaled down to it, which comes to roughly 2,300 image tokens.
+MAX_MODEL_DIMENSION = 2048
+
+# The Ollama box loads models from a spinning disk; after a reboot or an idle unload
+# the first request waits about 5 minutes for the model to load. A shorter timeout
+# cancels the load, so every retry starts it over and never finishes.
+GENERATE_TIMEOUT_SECONDS = 900
+
 DESCRIBE_PROMPT = (
     'Describe this image in 1-2 sentences. Then, if any text is visible, '
-    'add a "Text:" line with the text transcribed verbatim. Be concise.'
+    'add a "Text:" line with the text transcribed verbatim. Be concise. '
+    # qwen3-vl read Costa Rican prices (₡29.900) as $29.900 until told otherwise.
+    'Copy currency symbols exactly as printed: the Costa Rican colón sign ₡ '
+    '(a C with one or two slashes) is not a dollar sign, so never write $ for it.'
 )
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
@@ -246,6 +259,16 @@ def lookup_message_for_image_file(image_path: Path) -> tuple[str, str] | None:
     return candidates[0][0], chat_jid
 
 
+def is_webp(path: Path) -> bool:
+    """True when the file's bytes are WebP, whatever its extension says."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(12)
+    except OSError:
+        return False
+    return header[:4] == b"RIFF" and header[8:12] == b"WEBP"
+
+
 def image_dimensions(path: Path) -> tuple[int | None, int | None]:
     """Return (width, height) by reading JPEG/PNG headers. Returns (None, None) on failure."""
     try:
@@ -348,9 +371,21 @@ def _model_safe_bytes(path: Path) -> bytes:
     with an HTTP 500 (not just this request). Pad such images onto a large
     enough canvas first; the padding is inert whitespace and does not change
     what the model reads.
+
+    Images whose longer side exceeds MAX_MODEL_DIMENSION are scaled down to it
+    so they fit the model's context; everything else is sent unchanged.
     """
     raw = path.read_bytes()
     width, height = image_dimensions(path)
+    if (
+        width
+        and height
+        and max(width, height) > MAX_MODEL_DIMENSION
+        # Never shrink a sliver below the minimum; that would crash the runner.
+        and min(width, height) * MAX_MODEL_DIMENSION // max(width, height)
+        >= MIN_MODEL_DIMENSION
+    ):
+        return _shrunk_bytes(path, width, height)
     if not width or not height or min(width, height) >= MIN_MODEL_DIMENSION:
         return raw
 
@@ -381,6 +416,25 @@ def _model_safe_bytes(path: Path) -> bytes:
             ) from e
 
 
+def _shrunk_bytes(path: Path, width: int, height: int) -> bytes:
+    """Return the image scaled so its longer side is MAX_MODEL_DIMENSION."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / f"shrunk{path.suffix or '.jpg'}"
+        try:
+            subprocess.run(
+                ["sips", "-Z", str(MAX_MODEL_DIMENSION), str(path), "--out", str(out)],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+            return out.read_bytes()
+        except (OSError, subprocess.SubprocessError) as e:
+            # The original would overflow the context and get a 400 anyway.
+            raise RuntimeError(
+                f"cannot shrink {width}x{height} image to {MAX_MODEL_DIMENSION}px: {e}"
+            ) from e
+
+
 def describe_image(
     path: Path,
     model: str = DEFAULT_MODEL,
@@ -399,7 +453,7 @@ def describe_image(
         "stream": False,
         "keep_alive": "30m",
     }
-    resp = requests.post(f"{OLLAMA_API_URL}/api/generate", json=payload, timeout=300)
+    resp = requests.post(f"{OLLAMA_API_URL}/api/generate", json=payload, timeout=GENERATE_TIMEOUT_SECONDS)
     resp.raise_for_status()
     text = (resp.json().get("response") or "").strip()
     return _split_description_and_ocr(text)
@@ -550,6 +604,12 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         if not image:
             skipped += 1
             print(f"[skip] {short_id} no image file for {chat_jid} @ {timestamp}")
+            continue
+        if is_webp(image):
+            # Ollama rejected a WebP status image ("Failed to load image") on every
+            # run; skip WebP rather than fail on it again each time.
+            skipped += 1
+            print(f"[skip] {short_id} WebP not supported by the model ({image.name})")
             continue
         try:
             result = describe_and_record(img_conn, message_id, chat_jid, image, model_name)
