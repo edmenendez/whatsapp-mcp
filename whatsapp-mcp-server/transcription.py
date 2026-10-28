@@ -2,11 +2,19 @@
 
 CLI:
     uv run python transcription.py backfill [--model PATH] [--chat JID] [--limit N] [--dry-run]
+    uv run python transcription.py redo [--model PATH] [--chat JID] [--limit N] [--dry-run]
     uv run python transcription.py search "query" [--chat JID] [--limit N] [--only text|audio]
 
+Model routing: the main model (turbo) handles most clips. Clips shorter than
+SHORT_CLIP_SECONDS go straight to the accurate model, and any clip the main
+model tags with a language outside EXPECTED_LANGUAGES is re-run on it. Turbo
+misdetects the language on very short clips (3 s Spanish came back as
+Icelandic); large-v3 does not. Language is always auto-detected, never forced.
+
 Environment:
-    WHISPER_MODEL_PATH   Path to a ggml-*.bin model file
-    WHATSAPP_DB_PATH     Path to messages.db (default: ../whatsapp-bridge/store/messages.db)
+    WHISPER_MODEL_PATH           Path to the main ggml-*.bin model file
+    WHISPER_ACCURATE_MODEL_PATH  Path to the model for short or odd-language clips
+    WHATSAPP_DB_PATH             Path to messages.db (default: ../whatsapp-bridge/store/messages.db)
 """
 
 from __future__ import annotations
@@ -36,6 +44,12 @@ DEFAULT_MODEL = os.environ.get(
     "WHISPER_MODEL_PATH",
     "/Volumes/Crucial X10/whisper-models/ggml-large-v3-turbo.bin",
 )
+ACCURATE_MODEL = os.environ.get(
+    "WHISPER_ACCURATE_MODEL_PATH",
+    "/Volumes/Crucial X10/whisper-models/ggml-large-v3.bin",
+)
+SHORT_CLIP_SECONDS = 6.0
+EXPECTED_LANGUAGES = {"es", "en"}
 
 BRIDGE_API_URL = os.environ.get("WHATSAPP_API_URL", "http://localhost:8080/api")
 
@@ -148,10 +162,22 @@ def find_audio_file(chat_jid: str, timestamp: str, message_id: str | None = None
     return None
 
 
-def transcribe_audio(ogg_path: Path, model_path: str) -> tuple[str, str | None, float | None]:
-    """Convert to 16kHz mono WAV and run whisper-cli. Returns (text, language, duration_sec)."""
+def transcribe_audio(
+    ogg_path: Path,
+    model_path: str,
+    accurate_model_path: str | None = ACCURATE_MODEL,
+) -> tuple[str, str | None, float | None, str]:
+    """Convert to 16kHz mono WAV and run whisper-cli with model routing.
+
+    Returns (text, language, duration_sec, model_path_used). Routing is skipped
+    when the accurate model is missing or is the main model.
+    """
     require_binary("ffmpeg")
     require_binary("whisper-cli")
+
+    use_accurate = bool(
+        accurate_model_path and accurate_model_path != model_path and Path(accurate_model_path).exists()
+    )
 
     with tempfile.TemporaryDirectory() as td:
         wav = Path(td) / "audio.wav"
@@ -164,25 +190,38 @@ def transcribe_audio(ogg_path: Path, model_path: str) -> tuple[str, str | None, 
             check=True,
             capture_output=True,
         )
+        # 16 kHz mono 16-bit PCM is 32,000 bytes per second after the 44-byte header.
+        clip_seconds = max(wav.stat().st_size - 44, 0) / 32000
 
-        out_prefix = Path(td) / "out"
-        subprocess.run(
-            [
-                "whisper-cli",
-                "-m", model_path,
-                "-f", str(wav),
-                "-l", "auto",
-                "-oj",
-                "-of", str(out_prefix),
-                "--no-prints",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        if use_accurate and clip_seconds < SHORT_CLIP_SECONDS:
+            return (*_run_whisper(wav, accurate_model_path), accurate_model_path)
 
-        json_path = Path(str(out_prefix) + ".json")
-        data = json.loads(json_path.read_text())
+        text, language, duration = _run_whisper(wav, model_path)
+        if use_accurate and language not in EXPECTED_LANGUAGES:
+            return (*_run_whisper(wav, accurate_model_path), accurate_model_path)
+        return text, language, duration, model_path
+
+
+def _run_whisper(wav: Path, model_path: str) -> tuple[str, str | None, float | None]:
+    """Run whisper-cli on a prepared WAV with language auto-detection."""
+    out_prefix = wav.with_name(f"out_{Path(model_path).stem}")
+    subprocess.run(
+        [
+            "whisper-cli",
+            "-m", model_path,
+            "-f", str(wav),
+            "-l", "auto",
+            "-oj",
+            "-of", str(out_prefix),
+            "--no-prints",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    json_path = Path(str(out_prefix) + ".json")
+    data = json.loads(json_path.read_text())
 
     segments = data.get("transcription", [])
     text = " ".join(seg.get("text", "").strip() for seg in segments).strip()
@@ -205,11 +244,22 @@ def record_transcript(
     duration: float | None,
     model_name: str,
 ) -> None:
-    """Insert or replace a transcription row."""
+    """Insert or update a transcription row.
+
+    An upsert rather than INSERT OR REPLACE: REPLACE deletes the old row without
+    firing the delete trigger, which would leave the old text in the FTS index.
+    """
     conn.execute(
-        """INSERT OR REPLACE INTO transcriptions
+        """INSERT INTO transcriptions
            (message_id, chat_jid, transcription, language, model, duration_sec, audio_sha256)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (message_id, chat_jid) DO UPDATE SET
+               transcription = excluded.transcription,
+               language = excluded.language,
+               model = excluded.model,
+               duration_sec = excluded.duration_sec,
+               audio_sha256 = excluded.audio_sha256,
+               transcribed_at = CURRENT_TIMESTAMP""",
         (message_id, chat_jid, text, language, model_name, duration, sha256_file(audio_path)),
     )
     conn.commit()
@@ -285,7 +335,7 @@ def transcribe_and_record(
     model_path: str,
 ) -> tuple[str, str | None, float | None] | None:
     """Transcribe audio and write to DB. Returns (text, language, duration) on success, None if empty."""
-    text, language, duration = transcribe_audio(audio_path, model_path)
+    text, language, duration, used_model = transcribe_audio(audio_path, model_path)
     if not text:
         return None
     record_transcript(
@@ -296,7 +346,7 @@ def transcribe_and_record(
         text,
         language,
         duration,
-        Path(model_path).name,
+        Path(used_model).name,
     )
     return text, language, duration
 
@@ -392,6 +442,74 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
+def cmd_redo(args: argparse.Namespace) -> int:
+    """Re-run routing on existing rows that the accurate model would now handle.
+
+    Candidates are rows not already from the accurate model whose stored
+    duration is under the cutoff (plus slack, since whisper's last segment ends
+    before the audio does) or whose language is unexpected. Only rows the
+    router actually sends to the accurate model are rewritten.
+    """
+    model_path = args.model or DEFAULT_MODEL
+    if not Path(ACCURATE_MODEL).exists():
+        sys.exit(f"error: accurate model not found: {ACCURATE_MODEL}")
+
+    ensure_schema(transcriptions_db_path())
+    msgs_conn = sqlite3.connect(f"file:{messages_db_path()}?mode=ro", uri=True)
+    trans_conn = sqlite3.connect(transcriptions_db_path())
+
+    sql = (
+        "SELECT message_id, chat_jid, language, duration_sec FROM transcriptions "
+        "WHERE model != ? AND (duration_sec IS NULL OR duration_sec < ? "
+        f"OR language IS NULL OR language NOT IN ({','.join('?' * len(EXPECTED_LANGUAGES))}))"
+    )
+    params: list = [Path(ACCURATE_MODEL).name, SHORT_CLIP_SECONDS + 2, *sorted(EXPECTED_LANGUAGES)]
+    if args.chat:
+        sql += " AND chat_jid = ?"
+        params.append(args.chat)
+    sql += " ORDER BY duration_sec"
+    if args.limit:
+        sql += " LIMIT ?"
+        params.append(args.limit)
+    candidates = trans_conn.execute(sql, params).fetchall()
+    print(f"Found {len(candidates)} candidate rows.")
+    if args.dry_run:
+        return 0
+
+    redone = kept = skipped = failed = 0
+    for message_id, chat_jid, old_language, _ in candidates:
+        short_id = message_id[:12]
+        row = msgs_conn.execute(
+            "SELECT timestamp FROM messages WHERE id = ? AND chat_jid = ?", (message_id, chat_jid)
+        ).fetchone()
+        audio = find_audio_file(chat_jid, row[0], message_id) if row else None
+        if not audio:
+            skipped += 1
+            print(f"[skip] {short_id} no audio file")
+            continue
+        try:
+            text, language, duration, used_model = transcribe_audio(audio, model_path)
+        except subprocess.CalledProcessError as e:
+            failed += 1
+            print(f"[fail] {short_id} whisper/ffmpeg: {str(e.stderr)[:200]}")
+            continue
+        if used_model != ACCURATE_MODEL:
+            kept += 1
+            continue
+        if not text:
+            skipped += 1
+            print(f"[skip] {short_id} empty transcript")
+            continue
+        record_transcript(
+            trans_conn, message_id, chat_jid, audio, text, language, duration, Path(used_model).name
+        )
+        redone += 1
+        print(f"[redo] {short_id} {old_language or '?'}->{language or '?'} {len(text)}ch")
+
+    print(f"\nDone: {redone} redone, {kept} kept main model, {skipped} skipped, {failed} failed.")
+    return 0 if failed == 0 else 1
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     ensure_schema(transcriptions_db_path())
     conn = sqlite3.connect(f"file:{transcriptions_db_path()}?mode=ro", uri=True)
@@ -482,6 +600,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --download, only fetch media newer than N days (older CDN URLs have expired)",
     )
     bf.set_defaults(func=cmd_backfill)
+
+    rd = sub.add_parser("redo", help="Re-transcribe existing short or odd-language rows with the accurate model")
+    rd.add_argument("--model", default=None, help="Path to the main whisper ggml model (default: env WHISPER_MODEL_PATH)")
+    rd.add_argument("--chat", default=None, help="Restrict to one chat JID")
+    rd.add_argument("--limit", type=int, default=None, help="Max rows to consider")
+    rd.add_argument("--dry-run", action="store_true", help="Only count the candidate rows")
+    rd.set_defaults(func=cmd_redo)
 
     s = sub.add_parser("search", help="Search text messages and audio transcripts")
     s.add_argument("query", help="Search query (FTS5 syntax for audio, LIKE for text)")
