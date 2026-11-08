@@ -18,6 +18,7 @@ import argparse
 import base64
 import hashlib
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -459,6 +460,24 @@ def describe_image(
     return _split_description_and_ocr(text)
 
 
+# The model answers "no text" in many phrasings: "None visible.", "(No visible text)",
+# "There is no visible text in the image." and so on. Store those as NULL.
+_NO_TEXT_RE = re.compile(
+    r"(?:none(?: visible)?|not visible"
+    r"|(?:there is )?no (?:visible |discernible |readable )?text(?: is)?(?: visible| discernible| readable)?"
+    r"(?: in (?:the|this) image)?)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_ocr(ocr_text: str | None) -> str | None:
+    """Return None when the OCR text is a model "no text" answer, else the text unchanged."""
+    if ocr_text is None:
+        return None
+    core = ocr_text.strip().strip("()[]").strip().rstrip(".").strip()
+    return None if _NO_TEXT_RE.fullmatch(core) else ocr_text
+
+
 def _split_description_and_ocr(text: str) -> tuple[str, str | None]:
     """Split the model output on the first 'Text:' marker (case-insensitive, bol).
 
@@ -473,7 +492,7 @@ def _split_description_and_ocr(text: str) -> tuple[str, str | None]:
             ocr_parts = [head] if head else []
             ocr_parts.extend(line for line in tail_lines)
             description = "\n".join(lines[:i]).strip()
-            ocr_text = "\n".join(ocr_parts).strip() or None
+            ocr_text = _normalize_ocr("\n".join(ocr_parts).strip() or None)
             return description, ocr_text
     return text.strip(), None
 

@@ -56,3 +56,36 @@ class TestModelMinimum:
     def test_min_dimension_matches_patch_stride(self):
         """16px patches merged 2x2; below this the Ollama runner crashes."""
         assert MIN_MODEL_DIMENSION == 32
+
+
+class TestSplitDescriptionAndOcr:
+    """The model's "no text" answers are stored as NULL OCR, real text is kept."""
+
+    def test_no_text_phrasings_become_none(self):
+        from image_description import _split_description_and_ocr
+
+        for answer in [
+            "None visible",
+            "None visible.",
+            "none",
+            "(No visible text)",
+            "There is no visible text in the image.",
+            "(No text is visible in the image.)",
+            "(No discernible text visible)",
+            "(none visible)",
+            "[No text is visible in the image.]",
+            "(No readable text visible in the image)",
+            "(not visible)",
+        ]:
+            assert _split_description_and_ocr(f"A photo.\nText: {answer}") == ("A photo.", None), answer
+
+    def test_real_text_is_kept(self):
+        from image_description import _split_description_and_ocr
+
+        for answer in ["TE AMO", "No aplica para comer en restaurante", "None of the above", "Nonetheless"]:
+            assert _split_description_and_ocr(f"An ad.\nText: {answer}") == ("An ad.", answer), answer
+
+    def test_multiline_ocr_is_kept(self):
+        from image_description import _split_description_and_ocr
+
+        assert _split_description_and_ocr("An ad.\nText:\nLine one\nLine two") == ("An ad.", "Line one\nLine two")
