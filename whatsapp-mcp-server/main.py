@@ -450,4 +450,11 @@ if __name__ == "__main__":
 
     if transport == "stdio":
         install_stdio_parent_watchdog("WHATSAPP_PARENT_WATCHDOG_S", parent_pid=parent_pid)
-    mcp.run(transport=transport)
+        mcp.run(transport="stdio")
+    elif transport == "streamable-http":
+        from http_server import serve
+
+        serve(mcp, mcp.settings.host, mcp.settings.port)
+    else:
+        # SSE has no token check here, and this server can send messages.
+        raise SystemExit("WHATSAPP_MCP_TRANSPORT=sse is not supported; use http")

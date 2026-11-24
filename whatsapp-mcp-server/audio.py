@@ -58,8 +58,10 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
 
     try:
         # Run the ffmpeg command and capture output
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
         return output_file
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Audio conversion took longer than 120s and was stopped") from None
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Failed to convert audio. You likely need to install ffmpeg {e.stderr}")
 

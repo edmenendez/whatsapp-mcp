@@ -21,6 +21,12 @@ WHATSMEOW_DB_PATH = os.getenv(
     os.path.join(_DEFAULT_BRIDGE_STORE_DIR, "whatsapp.db"),
 )
 WHATSAPP_API_BASE_URL = os.getenv("WHATSAPP_API_URL", "http://localhost:8080/api")
+# Bridge calls must not hang forever: one stuck call would block the shared server.
+BRIDGE_TIMEOUT_S = 60
+SEND_TIMEOUT_MESSAGE = (
+    f"Timed out after {BRIDGE_TIMEOUT_S}s waiting for the WhatsApp bridge. "
+    "The message may have been sent: check the chat before retrying."
+)
 TRANSCRIPTIONS_DB_PATH = os.getenv(
     "WHATSAPP_TRANSCRIPTIONS_DB_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store", "transcriptions.db"),
@@ -1098,7 +1104,7 @@ def send_message(
         if mentions:
             payload["mentions"] = mentions
 
-        response = requests.post(url, json=payload, headers=_bridge_headers())
+        response = requests.post(url, json=payload, headers=_bridge_headers(), timeout=BRIDGE_TIMEOUT_S)
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -1107,6 +1113,8 @@ def send_message(
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
 
+    except requests.Timeout:
+        return False, SEND_TIMEOUT_MESSAGE
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -1130,7 +1138,7 @@ def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {"recipient": recipient, "media_path": media_path}
 
-        response = requests.post(url, json=payload, headers=_bridge_headers())
+        response = requests.post(url, json=payload, headers=_bridge_headers(), timeout=BRIDGE_TIMEOUT_S)
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -1139,6 +1147,8 @@ def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
 
+    except requests.Timeout:
+        return False, SEND_TIMEOUT_MESSAGE
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -1168,7 +1178,7 @@ def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {"recipient": recipient, "media_path": media_path}
 
-        response = requests.post(url, json=payload, headers=_bridge_headers())
+        response = requests.post(url, json=payload, headers=_bridge_headers(), timeout=BRIDGE_TIMEOUT_S)
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -1177,6 +1187,8 @@ def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
 
+    except requests.Timeout:
+        return False, SEND_TIMEOUT_MESSAGE
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -1220,7 +1232,7 @@ def send_reaction(
             "sender_jid": sender_jid,
         }
 
-        response = requests.post(url, json=payload, headers=_bridge_headers())
+        response = requests.post(url, json=payload, headers=_bridge_headers(), timeout=BRIDGE_TIMEOUT_S)
 
         if response.status_code == 200:
             result = response.json()
@@ -1230,6 +1242,8 @@ def send_reaction(
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
 
+    except requests.Timeout:
+        return False, SEND_TIMEOUT_MESSAGE
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -1252,7 +1266,7 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
         url = f"{WHATSAPP_API_BASE_URL}/download"
         payload = {"message_id": message_id, "chat_jid": chat_jid}
 
-        response = requests.post(url, json=payload, headers=_bridge_headers())
+        response = requests.post(url, json=payload, headers=_bridge_headers(), timeout=BRIDGE_TIMEOUT_S)
 
         if response.status_code == 200:
             result = response.json()
